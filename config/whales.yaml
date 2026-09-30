@@ -1,0 +1,21 @@
+# ============================================================
+#  محافظ الحيتان وعناوين المنصات
+#  - لم أضع عناوين صناع السوق (Wintermute, DWF, Jump ...) عمداً: لا يمكنني
+#    التحقق منها، وأي عنوان خاطئ = إشارات كاذبة. أضفها أنت من Arkham أو
+#    Etherscan Labels أو Solscan ثم ضعها في wallets.
+#  - الرادار يعمل بدون هذا الملف (يعتمد على القطاعات + تدفق العملات المستقرة + DEX)،
+#    لكن إضافة المحافظ ترفع جودة الإشارات كثيراً.
+# ============================================================
+
+# عناوين منصات مركزية (لاكتشاف Exchange Inflow / Outflow). أضف المزيد من Etherscan Labels.
+# تحقق من العناوين قبل الاعتماد عليها.
+exchanges:
+  "Binance 14": "0x28c6c06298d514db089934071355e5743bf21d60"
+  "Binance 7":  "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8"
+
+# chains المدعومة لـ EVM: ethereum, base, arbitrum, bsc, polygon, optimism, avalanche
+# وللسولانا: chain: solana
+wallets: []
+  # - {label: "Market Maker A", chain: ethereum, address: "0x..."}
+  # - {label: "Smart Money B",  chain: base,     address: "0x..."}
+  # - {label: "SOL Whale 1",    chain: solana,   address: "..."}
