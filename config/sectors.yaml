@@ -1,0 +1,36 @@
+# ============================================================
+#  القطاعات (سلات) والأنظمة البيئية للشبكات
+#  category = معرّف الفئة في CoinGecko. المعرّفات غير الصحيحة تُتجاهل تلقائياً
+#  مع تحذير في السجل. للتحقق:  python -m radar check
+# ============================================================
+
+sectors:
+  rwa:      {label: "RWA · الأصول الحقيقية",  category: real-world-assets-rwa}
+  zk:       {label: "ZK · المعرفة الصفرية",   category: zero-knowledge-zk}
+  ai:       {label: "AI · الذكاء الاصطناعي",  category: artificial-intelligence}
+  depin:    {label: "DePIN · البنية اللامركزية", category: depin}
+  defi:     {label: "DeFi · التمويل اللامركزي", category: decentralized-finance-defi}
+  l1:       {label: "Layer 1 · الشبكات الجديدة", category: layer-1}
+  l2:       {label: "Layer 2 · طبقة ثانية",   category: layer-2}
+  meme:     {label: "Meme · الميم",           category: meme-token}
+  gaming:   {label: "Gaming · الألعاب",       category: gaming}
+  oracle:   {label: "Oracle · الأوراكل",      category: oracle}
+  privacy:  {label: "Privacy · الخصوصية",     category: privacy-coins}
+
+# native   = معرّف العملة الأم في CoinGecko (اتركه null إن لم توجد عملة أم مثل Base)
+# category = فئة النظام البيئي في CoinGecko
+# chain    = اسم الشبكة في DefiLlama (لتتبع تدفق العملات المستقرة/الجسور)
+ecosystems:
+  solana:      {label: "Solana",      native: solana,                   category: solana-ecosystem,        chain: Solana}
+  sui:         {label: "Sui",         native: sui,                      category: sui-ecosystem,           chain: Sui}
+  ethereum:    {label: "Ethereum",    native: ethereum,                 category: ethereum-ecosystem,      chain: Ethereum}
+  base:        {label: "Base",        native: null,                     category: base-ecosystem,          chain: Base}
+  arbitrum:    {label: "Arbitrum",    native: arbitrum,                 category: arbitrum-ecosystem,      chain: Arbitrum}
+  avalanche:   {label: "Avalanche",   native: avalanche-2,              category: avalanche-ecosystem,     chain: Avalanche}
+  bnb:         {label: "BNB Chain",   native: binancecoin,              category: binance-smart-chain,     chain: BSC}
+  near:        {label: "NEAR",        native: near,                     category: near-protocol-ecosystem, chain: Near}
+  aptos:       {label: "Aptos",       native: aptos,                    category: aptos-ecosystem,         chain: Aptos}
+  ton:         {label: "TON",         native: the-open-network,         category: ton-ecosystem,           chain: TON}
+  tron:        {label: "Tron",        native: tron,                     category: tron-ecosystem,          chain: Tron}
+  polygon:     {label: "Polygon",     native: polygon-ecosystem-token,  category: polygon-ecosystem,       chain: Polygon}
+  hyperliquid: {label: "Hyperliquid", native: hyperliquid,              category: hyperliquid-ecosystem,   chain: "Hyperliquid L1"}
