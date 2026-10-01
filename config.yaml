@@ -1,0 +1,145 @@
+# ============================================================
+#  config.yaml — كل إعدادات رادار شلال السيولة في ملف واحد
+#  الأقسام: العتبات ← القطاعات ← الأنظمة البيئية (داخل whales: المنصات والمحافظ)
+#  حافظ على المسافات (Indentation) كما هي عند التعديل.
+# ============================================================
+
+run:
+  timezone: "Europe/Istanbul"   # توقيت العرض داخل رسائل تيليجرام
+  min_score: 58                 # الحد الأدنى لقوة الإشارة (0-100). يتكيّف تلقائياً مع نتائج التعلّم
+  max_alerts_per_run: 3         # أقصى عدد تنبيهات في التشغيلة الواحدة
+  cooldown_hours: 12            # لا يُعاد تنبيه نفس العملة قبل مرور هذه المدة
+  heartbeat_hours: 24           # رسالة "الرادار يعمل" كل N ساعة (0 = تعطيل)
+  notify_outcomes: true         # إرسال نتيجة كل صفقة (هدف/وقف) عند إغلاقها
+  dex_confirm_top: 8            # عدد المرشحين الذين يُفحصون على DEX/On-Chain في كل تشغيلة
+
+universe:
+  min_market_cap: 15000000      # أقل قيمة سوقية (USD)
+  max_market_cap: 4000000000    # أعلى قيمة سوقية للمرشحين
+  min_volume_24h: 1500000       # أقل حجم تداول 24 ساعة
+  per_page: 60                  # عدد العملات المسحوبة لكل قطاع
+
+gates:                          # بوابات "قبل الانفجار": نستبعد ما انفجر فعلاً
+  max_coin_24h: 12.0            # % أقصى صعود 24س مسموح للعملة المرشحة
+  max_coin_1h: 5.0              # % أقصى صعود 1س
+
+sector:                         # مصفوفة تدوير القطاعات
+  hot_heat: 4.0                 # % حرارة القطاع لاعتباره "ساخناً"
+  min_breadth: 0.55             # نسبة العملات الصاعدة داخل القطاع
+  laggard_gap: 4.0              # % الفجوة بين القطاع والعملة المتأخرة
+  laggard_max_24h: 6.0          # % أقصى أداء 24س للعملة "المتأخرة"
+  min_corr: 0.40                # أدنى معامل ارتباط مع القطاع
+  max_7d_dump: -40.0            # % نستبعد العملات المنهارة أسبوعياً
+
+waterfall:                      # شلال السيولة البيئي
+  native_24h: 5.0               # % صعود العملة الأم خلال 24س لتفعيل الفحص
+  native_1h: 2.0                # % صعود العملة الأم خلال ساعة
+  max_triggers: 3               # أقصى عدد شبكات تُفحص لكل تشغيلة (حماية حدود API)
+  min_corr: 0.30
+  laggard_gap: 3.0
+
+attention:                      # زخم الانتباه
+  alpha: 0.02                   # سرعة تعلّم خط الأساس (EWMA)
+  warmup_runs: 12               # عدد التشغيلات قبل اعتبار خط الأساس جاهزاً (~ساعتان)
+  trending_penalty: 8           # خصم نقاط إذا كانت العملة Trending أصلاً (جمهور التجزئة سبقنا)
+
+bridge:                         # جسور العبور / تدفق السيولة للشبكات
+  min_stable_inflow_usd_6h: 30000000   # تدفق عملات مستقرة صافٍ للشبكة خلال 6س
+  min_stable_inflow_pct_6h: 0.5        # % من المعروض المستقر للشبكة
+  history_hours: 48
+
+whales:                         # تتبع المحافظ (يحتاج مفتاح Etherscan و/أو محافظ في هذا الملف (قسم whales.wallets))
+  min_usd: 100000               # أقل قيمة حركة لتعتبر "حوتاً"
+  min_liquidity: 250000         # أقل سيولة للعملة (فلتر ضد عملات السبام)
+  first_run_lookback_min: 60
+  max_wallets: 25
+  sell_block_usd: 250000        # إذا أودع الحيتان هذه القيمة في منصة → نمنع التنبيه
+  token_flow_check: true        # فحص تدفق المنصات (Inflow/Outflow) على عقد العملة نفسها
+
+  # ---------- عناوين المنصات (لاكتشاف Exchange Inflow / Outflow) ----------
+  # كلها موسومة على Etherscan Labels (تم التحقق منها). المنصات الكبرى تملك عناوين كثيرة،
+  # لذلك التغطية جزئية. أضف المزيد من Etherscan (أي عنوان عليه وسم Exchange).
+  exchanges:
+    "Binance 14":          "0x28c6c06298d514db089934071355e5743bf21d60"
+    "Binance Hot Wallet":  "0xdfd5293d8e347dfe59e90efd55b2956a1343963d"
+    "Coinbase 10":         "0xa9d1e08c7793af67e9d92fe308d5697fb81d3e43"
+    "Bybit Hot Wallet":    "0xf89d7b9c864f589bbf53a82105107622b35eaa40"
+
+  # ---------- محافظ الحيتان / صناع السوق / الصناديق ----------
+  # weight = وزن الثقة بالإشارة (0-1). محافظ صناع السوق تتداول باستمرار فإشاراتها أضعف.
+  # EOA يمكن أن يكون نفس العنوان على عدة شبكات EVM: كل شبكة تحتاج سطراً مستقلاً.
+  # ملاحظة: شبكات base و bsc قد لا تكون متاحة في الخطة المجانية لـ Etherscan؛ إن لم تعمل تُتجاهل تلقائياً.
+  wallets:
+    # --- DWF Labs: عنوان أعلنه DWF رسمياً لمشترياته من السوق الثانوي (أقوى إشارة هنا) ---
+    - {label: "DWF Labs (مشتريات معلنة)", chain: ethereum, address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
+    - {label: "DWF Labs (مشتريات معلنة)", chain: bsc,      address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
+    - {label: "DWF Labs (مشتريات معلنة)", chain: base,     address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
+    - {label: "DWF Labs (مشتريات معلنة)", chain: solana,   address: "HwDkuDCUipJHHKodBBCjffFvrjhmd4iVVh7fq25fShvt", weight: 1.0}
+    # --- DWF Labs: عناوين موسومة على Etherscan ---
+    - {label: "DWF Labs", chain: ethereum, address: "0xD4B69e8D62C880E9DD55d419d5E07435C3538342", weight: 0.7}
+    - {label: "DWF Labs", chain: ethereum, address: "0xddAcAd3B1edee8E2F5b2e84f658202534fcb0374", weight: 0.7}
+    # --- a16z ---
+    - {label: "a16z",                   chain: ethereum, address: "0x05E793cE0C6027323Ac150F6d45C2344d28B6019", weight: 0.9}   # وسم Etherscan
+    - {label: "a16z (منسوب، غير مؤكد)", chain: ethereum, address: "0xb5E4d21240e9356caFc3a1261d10383f62DFc24e", weight: 0.7}   # نسبه Lookonchain/Arkham ولم تؤكده a16z
+    # --- Wintermute (صانع سوق: نشاط مرتفع دائم، وزن منخفض) ---
+    - {label: "Wintermute",   chain: ethereum, address: "0xDBF5E9c5206d0dB70a90108bf936DA60221dC080", weight: 0.5}
+    - {label: "Wintermute 2", chain: ethereum, address: "0x000002Cba8DfB0a86A47a415592835E17fac080a", weight: 0.4}
+    # --- Jump Trading ---
+    - {label: "Jump Trading", chain: ethereum, address: "0xf584F8728B874a6a5c7A8d4d387C9aae9172D621", weight: 0.6}
+
+dex:                            # تأكيد DexScreener
+  min_liquidity: 150000
+  identity_low: 0.35            # فلتر هوية العملة: نسبة قيمة DEX السوقية إلى CoinGecko
+  identity_high: 3.0
+  min_txns_h1: 20
+
+risk:                           # حساب الهدف والوقف (متكيّف مع تذبذب العملة)
+  default_daily_vol: 6.0
+  stop_min: 4.0
+  stop_max: 12.0
+  rr: 1.8                       # نسبة العائد/المخاطرة
+  horizon_hours: 36             # بعدها تُغلق الصفقة للتقييم
+
+learning:                       # التعلّم الذاتي
+  min_samples: 30               # عدد الصفقات المُقيَّمة قبل أن يبدأ النموذج بالتأثير
+  max_alpha: 0.7                # أقصى وزن للنموذج المتعلَّم مقابل الأوزان الأولية
+  alpha_k: 60
+  lr: 0.05
+  l2: 0.01
+  win_window: 30                # نافذة حساب نسبة النجاح الأخيرة لتكييف الحد الأدنى
+
+network:
+  coingecko_interval_free: 4.5  # ثواني بين الطلبات بدون مفتاح
+  coingecko_interval_key: 2.2   # ثواني بين الطلبات مع مفتاح Demo
+
+# ---------------- القطاعات (سلات) ----------------
+sectors:
+  rwa:      {label: "RWA · الأصول الحقيقية",  category: real-world-assets-rwa}
+  zk:       {label: "ZK · المعرفة الصفرية",   category: zero-knowledge-zk}
+  ai:       {label: "AI · الذكاء الاصطناعي",  category: artificial-intelligence}
+  depin:    {label: "DePIN · البنية اللامركزية", category: depin}
+  defi:     {label: "DeFi · التمويل اللامركزي", category: decentralized-finance-defi}
+  l1:       {label: "Layer 1 · الشبكات الجديدة", category: layer-1}
+  l2:       {label: "Layer 2 · طبقة ثانية",   category: layer-2}
+  meme:     {label: "Meme · الميم",           category: meme-token}
+  gaming:   {label: "Gaming · الألعاب",       category: gaming}
+  oracle:   {label: "Oracle · الأوراكل",      category: oracle}
+  privacy:  {label: "Privacy · الخصوصية",     category: privacy-coins}
+
+# native   = معرّف العملة الأم في CoinGecko (اتركه null إن لم توجد عملة أم مثل Base)
+# category = فئة النظام البيئي في CoinGecko
+# chain    = اسم الشبكة في DefiLlama (لتتبع تدفق العملات المستقرة/الجسور)
+ecosystems:
+  solana:      {label: "Solana",      native: solana,                   category: solana-ecosystem,        chain: Solana}
+  sui:         {label: "Sui",         native: sui,                      category: sui-ecosystem,           chain: Sui}
+  ethereum:    {label: "Ethereum",    native: ethereum,                 category: ethereum-ecosystem,      chain: Ethereum}
+  base:        {label: "Base",        native: null,                     category: base-ecosystem,          chain: Base}
+  arbitrum:    {label: "Arbitrum",    native: arbitrum,                 category: arbitrum-ecosystem,      chain: Arbitrum}
+  avalanche:   {label: "Avalanche",   native: avalanche-2,              category: avalanche-ecosystem,     chain: Avalanche}
+  bnb:         {label: "BNB Chain",   native: binancecoin,              category: binance-smart-chain,     chain: BSC}
+  near:        {label: "NEAR",        native: near,                     category: near-protocol-ecosystem, chain: Near}
+  aptos:       {label: "Aptos",       native: aptos,                    category: aptos-ecosystem,         chain: Aptos}
+  ton:         {label: "TON",         native: the-open-network,         category: ton-ecosystem,           chain: TON}
+  tron:        {label: "Tron",        native: tron,                     category: tron-ecosystem,          chain: Tron}
+  polygon:     {label: "Polygon",     native: polygon-ecosystem-token,  category: polygon-ecosystem,       chain: Polygon}
+  hyperliquid: {label: "Hyperliquid", native: hyperliquid,              category: hyperliquid-ecosystem,   chain: "Hyperliquid L1"}
