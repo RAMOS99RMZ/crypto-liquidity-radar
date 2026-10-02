@@ -9,6 +9,10 @@ on:
         description: "تشغيل تجريبي (بدون تيليجرام)"
         type: boolean
         default: false
+      test_telegram:
+        description: "إرسال رسالة اختبار تيليجرام فقط"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,7 +44,15 @@ jobs:
           restore-keys: |
             radar-state-
 
+      - name: Test Telegram
+        if: ${{ inputs.test_telegram }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python radar.py test-telegram
+
       - name: Run radar
+        if: ${{ !inputs.test_telegram }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
