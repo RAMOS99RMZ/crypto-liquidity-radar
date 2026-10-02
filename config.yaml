@@ -72,8 +72,8 @@ whales:                         # تتبع المحافظ (يحتاج مفتاح
   wallets:
     # --- DWF Labs: عنوان أعلنه DWF رسمياً لمشترياته من السوق الثانوي (أقوى إشارة هنا) ---
     - {label: "DWF Labs (مشتريات معلنة)", chain: ethereum, address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
-    - {label: "DWF Labs (مشتريات معلنة)", chain: bsc,      address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
-    - {label: "DWF Labs (مشتريات معلنة)", chain: base,     address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
+    # (معطّل: Etherscan المجاني لا يدعم bsc) - {label: "DWF Labs (مشتريات معلنة)", chain: bsc,      address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
+    # (معطّل: Etherscan المجاني لا يدعم base) - {label: "DWF Labs (مشتريات معلنة)", chain: base,     address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
     - {label: "DWF Labs (مشتريات معلنة)", chain: solana,   address: "HwDkuDCUipJHHKodBBCjffFvrjhmd4iVVh7fq25fShvt", weight: 1.0}
     # --- DWF Labs: عناوين موسومة على Etherscan ---
     - {label: "DWF Labs", chain: ethereum, address: "0xD4B69e8D62C880E9DD55d419d5E07435C3538342", weight: 0.7}
@@ -107,6 +107,13 @@ learning:                       # التعلّم الذاتي
   lr: 0.05
   l2: 0.01
   win_window: 30                # نافذة حساب نسبة النجاح الأخيرة لتكييف الحد الأدنى
+
+coingecko:                      # ميزانية الطلبات (الخطة المجانية Demo = 10,000 طلب/شهر فقط!)
+  monthly_budget: 9000          # اترك هامشاً تحت 10,000. الرادار يوزّعها تلقائياً ويعمل على الكاش عند النفاد
+  min_refresh_minutes: 20       # لا يُحدَّث قطاع أحدث من هذه المدة
+  max_cache_age_hours: 6        # أقدم بيانات كاش مسموح استخدامها
+  trending_refresh_minutes: 60
+  retry_after_fail_minutes: 15  # بعد فشل/429 لا نعيد المحاولة قبل هذه المدة
 
 network:
   coingecko_interval_free: 4.5  # ثواني بين الطلبات بدون مفتاح
