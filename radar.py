@@ -138,7 +138,7 @@ class Config:
         self.ecosystems: dict = settings.get("ecosystems") or {}
         self.whales: dict = settings.get("whales") or {}
         # أسرار GitHub غير المعرّفة تصل كنص فارغ -> نعتبرها None
-        self.env = env if env is not None else {k: (os.environ.get(k) or None) for k in ENV_KEYS}
+        self.env = env if env is not None else {k: ((os.environ.get(k) or "").strip() or None) for k in ENV_KEYS}
 
     def get(self, path: str, default=_MISSING):
         node = self.settings
@@ -252,6 +252,10 @@ def default_state() -> dict:
         "model": None,
         "wallets": {"evm": {}, "sol": {}},
         "valid_categories": {"ts": 0, "ids": []},
+        "mcache": {},
+        "cg": {"tokens": 30.0, "ts": None, "month": "", "used": 0},
+        "trend": {"ts": 0, "ids": []},
+        "cg_fail": {},
     }
 
 
@@ -305,6 +309,7 @@ class CoinGecko:
 
     def __init__(self, http, api_key: Optional[str] = None, plan: str = "demo"):
         self.http = http
+        self.calls = 0
         self.headers: dict = {}
         self.base = self.PUBLIC
         if api_key:
@@ -315,6 +320,7 @@ class CoinGecko:
                 self.headers["x-cg-demo-api-key"] = api_key
 
     def _get(self, path: str, params: Optional[dict] = None):
+        self.calls += 1
         return self.http.get_json(self.base + path, params=params, headers=self.headers)
 
     def markets(self, category: Optional[str] = None, ids: Optional[list] = None, per_page: int = 60,
@@ -384,6 +390,22 @@ class DefiLlama:
 
     def __init__(self, http):
         self.http = http
+
+    PRICES = "https://coins.llama.fi/prices/current/"
+
+    def coin_prices(self, ids: list) -> dict:
+        """أسعار حالية مجانية بلا مفتاح ولا سقف شهري، بمعرّفات CoinGecko نفسها: {id: price}"""
+        out: dict = {}
+        for i in range(0, len(ids), 60):
+            keys = ",".join(f"coingecko:{x}" for x in ids[i:i + 60])
+            d = self.http.get_json(self.PRICES + keys)
+            coins = d.get("coins") if isinstance(d, dict) else None
+            if isinstance(coins, dict):
+                for k, v in coins.items():
+                    p = to_float(v.get("price")) if isinstance(v, dict) else None
+                    if p and p > 0 and str(k).startswith("coingecko:"):
+                        out[str(k)[len("coingecko:"):]] = p
+        return out
 
     def chains_tvl(self) -> dict:
         """{chain_norm: tvl_usd}"""
@@ -669,9 +691,11 @@ class Attention:
         self.warm = int(cfg.get("attention.warmup_runs"))
         self.now = now
 
-    def _obs(self, bucket: str, key: str, value: float):
+    def _obs(self, bucket: str, key: str, value: float, observe: bool = True):
         store = self.b.setdefault(bucket, {})
         rec = store.get(key)
+        if not observe:  # بيانات من الكاش (غير جديدة): لا نحدّث خط الأساس، نعيد آخر نسبة محسوبة
+            return rec.get("r") if rec else None
         if rec is None:
             store[key] = {"v": float(value), "n": 1, "ts": self.now}
             return None
@@ -681,17 +705,18 @@ class Attention:
         rec["v"] = base * (1 - self.alpha) + capped * self.alpha
         rec["n"] += 1
         rec["ts"] = self.now
-        return ratio if rec["n"] > self.warm else None
+        rec["r"] = ratio if rec["n"] > self.warm else None
+        return rec["r"]
 
-    def sector(self, key: str, turnover: float):
+    def sector(self, key: str, turnover: float, observe: bool = True):
         if turnover is None or turnover <= 0:
             return None
-        return self._obs("sector", key, turnover)
+        return self._obs("sector", key, turnover, observe)
 
-    def coin(self, coin):
+    def coin(self, coin, observe: bool = True):
         if not coin.mcap or coin.mcap <= 0 or coin.volume <= 0:
             return None
-        return self._obs("coin", coin.id, coin.volume / coin.mcap)
+        return self._obs("coin", coin.id, coin.volume / coin.mcap, observe)
 
     def prune(self, max_age_days: float = 7.0) -> None:
         for bucket in self.b.values():
@@ -907,7 +932,7 @@ class ConsoleNotifier:
 # ======================================================================
 # bots/sector_bot.py
 # ======================================================================
-def sector_analyze(sector_data: dict, cfg, att) -> tuple:
+def sector_analyze(sector_data: dict, cfg, att, fresh=None) -> tuple:
     """يعيد (stats لكل قطاع، قائمة مرشحين)."""
     sc = cfg.get("sector")
     stats: dict = {}
@@ -916,7 +941,7 @@ def sector_analyze(sector_data: dict, cfg, att) -> tuple:
         label = cfg.sectors[key].get("label", key)
         summ = group_summary(coins)
         prof = correlation_profile(coins)
-        att_ratio = att.sector(f"sector:{key}", summ["turnover"])  # يُحدَّث لكل القطاعات في كل تشغيلة
+        att_ratio = att.sector(f"sector:{key}", summ["turnover"], observe=(fresh is None or key in fresh))
         idx6, idx24 = prof["idx_6h"], prof["idx_24h"]
         ref = max(summ["median_24h"], idx24 if idx24 is not None else summ["median_24h"])
         heat = max(ref, 2.0 * idx6) if idx6 is not None else ref
@@ -1291,6 +1316,47 @@ def is_stable(c: Coin) -> bool:
             and c.mcap > 0 and c.volume / c.mcap > 0)  # ربط سعري ثابت بالدولار
 
 
+def coin_to_row(c: Coin) -> dict:
+    return {"id": c.id, "symbol": c.symbol, "name": c.name, "price": c.price, "mcap": c.mcap, "volume": c.volume,
+            "ch1h": c.ch1h, "ch24h": c.ch24h, "ch7d": c.ch7d, "spark": [float(f"{x:.6g}") for x in c.spark]}
+
+
+def row_to_coin(r) -> Optional[Coin]:
+    try:
+        return Coin(id=r["id"], symbol=r["symbol"], name=r["name"], price=float(r["price"]), mcap=float(r["mcap"]),
+                    volume=float(r["volume"]), ch1h=r.get("ch1h"), ch24h=r.get("ch24h"), ch7d=r.get("ch7d"),
+                    spark=list(r.get("spark") or []))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+class Budget:
+    """ميزانية طلبات CoinGecko (الخطة المجانية Demo = 10,000 طلب/شهر): دلو رموز يمتلئ ببطء.
+
+    كل طلب يستهلك رمزاً. عند نفاد الرموز يعمل الرادار على آخر بيانات محفوظة في الكاش بدل التوقف.
+    """
+    CAP = 40.0
+
+    def __init__(self, state_data: dict, cfg, now: float):
+        b = state_data.setdefault("cg", {"tokens": 30.0, "ts": None, "month": "", "used": 0})
+        self.b = b
+        self.monthly = float(cfg.get("coingecko.monthly_budget"))
+        rate = self.monthly / (30.0 * 86400.0)
+        if b.get("ts"):
+            b["tokens"] = min(self.CAP, float(b.get("tokens", 0.0)) + max(0.0, now - b["ts"]) * rate)
+        b["ts"] = now
+        month = time.strftime("%Y-%m", time.gmtime(now))
+        if b.get("month") != month:
+            b["month"], b["used"] = month, 0
+
+    def take(self, n: float = 1.0) -> bool:
+        if self.b["tokens"] >= n:
+            self.b["tokens"] -= n
+            self.b["used"] += int(n)
+            return True
+        return False
+
+
 class Engine:
     def __init__(self, cfg, state, cg, llama, dex, eth, sol, notifier, now_fn=time.time, dry_run: bool = False):
         self.cfg, self.state = cfg, state
@@ -1299,13 +1365,15 @@ class Engine:
         self.now_fn = now_fn
         self.dry_run = dry_run
         self._vr_cache: dict = {}
+        self.fresh_ids: set = set()
+        self.fresh_keys: set = set()
         self.summary: dict = {"sectors": {}, "signals": [], "near_miss": [], "closed": 0}
 
     # ------------------------------------------------------------------ أدوات مساعدة
     def vr(self, coin: Coin) -> Optional[float]:
         """نسبة حجم العملة إلى خط أساسها (تُحدَّث مرة واحدة لكل عملة في التشغيلة)."""
         if coin.id not in self._vr_cache:
-            self._vr_cache[coin.id] = self.att.coin(coin)
+            self._vr_cache[coin.id] = self.att.coin(coin, observe=coin.id in self.fresh_ids)
         return self._vr_cache[coin.id]
 
     def _universe(self, coins: list) -> list:
@@ -1315,11 +1383,68 @@ class Engine:
 
     def _valid_categories(self, now: float):
         vc = self.state.data["valid_categories"]
-        if now - vc.get("ts", 0) > 86400 or not vc.get("ids"):
+        failed = self.state.data.setdefault("cg_fail", {})
+        backoff = float(self.cfg.get("coingecko.retry_after_fail_minutes")) * 60
+        if ((now - vc.get("ts", 0) > 86400 or not vc.get("ids")) and now - failed.get("categories", 0) >= backoff
+                and self.budget.take()):
             ids = self.cg.category_ids()
             if ids:
                 vc["ts"], vc["ids"] = now, ids
+            else:
+                failed["categories"] = now
         return set(vc["ids"]) if vc.get("ids") else None
+
+    def _get_rows(self, ck: str, fetch, now: float) -> list:
+        """بيانات سوق من الكاش أو من CoinGecko حسب الميزانية والحداثة."""
+        cache = self.state.data["mcache"]
+        ent = cache.get(ck)
+        min_age = float(self.cfg.get("coingecko.min_refresh_minutes")) * 60
+        failed = self.state.data.setdefault("cg_fail", {})
+        backoff = float(self.cfg.get("coingecko.retry_after_fail_minutes")) * 60
+        recently_failed = now - failed.get(ck, 0) < backoff  # لا نحرق الميزانية على طلب فشل للتو
+        if (ent is None or now - ent["ts"] >= min_age) and not recently_failed and self.budget.take():
+            coins = fetch()
+            if coins:
+                cache[ck] = {"ts": now, "coins": [coin_to_row(c) for c in coins]}
+                self.fresh_keys.add(ck)
+                self.fresh_ids |= {c.id for c in coins}
+                return coins
+            failed[ck] = now
+            log.warning("فشل تحديث %s -> استخدام الكاش", ck)
+        ent = cache.get(ck)
+        if not ent or now - ent["ts"] > float(self.cfg.get("coingecko.max_cache_age_hours")) * 3600:
+            return []
+        return [c for c in (row_to_coin(r) for r in ent["coins"]) if c]
+
+    def _trending(self, now: float) -> set:
+        t = self.state.data["trend"]
+        failed = self.state.data.setdefault("cg_fail", {})
+        backoff = float(self.cfg.get("coingecko.retry_after_fail_minutes")) * 60
+        if (now - t.get("ts", 0) >= float(self.cfg.get("coingecko.trending_refresh_minutes")) * 60
+                and now - failed.get("trending", 0) >= backoff and self.budget.take()):
+            ids = self.cg.trending()
+            if ids:
+                t["ts"], t["ids"] = now, sorted(ids)
+            else:
+                failed["trending"] = now
+        return set(t.get("ids") or [])
+
+    def _fresh_price(self, c: Candidate) -> Optional[float]:
+        """سعر لحظي قبل التنبيه (DexScreener ثم DefiLlama المجاني) مع فلتر معقولية ±20%."""
+        cached = c.coin.price
+        cands = []
+        info = c.meta.get("dex")
+        if info:
+            cands.append(info.get("price"))
+        if c.src.get("src") == "cg":
+            try:
+                cands.append(self.llama.coin_prices([c.coin.id]).get(c.coin.id))
+            except Exception as exc:
+                log.warning("fresh price failed: %s", exc)
+        for p in cands:
+            if p and cached > 0 and 0.8 <= p / cached <= 1.25:
+                return float(p)
+        return None
 
     def _send(self, text: str) -> bool:
         try:
@@ -1340,29 +1465,42 @@ class Engine:
         self.brain = Brain(self.cfg, d)
         self.whale = WhaleBot(self.cfg, self.eth, self.sol, self.dex, d)
 
+        self.budget = Budget(d, self.cfg, now)
+        self.fresh_ids, self.fresh_keys = set(), set()
         self._update_outcomes(now)
 
         valid = self._valid_categories(now)
         per_page = int(self.cfg.get("universe.per_page"))
-        sector_data: dict = {}
+        native_ids = [e["native"] for e in self.cfg.ecosystems.values() if e.get("native")]
+        natives: dict = {}
+        if native_ids:
+            natives = {c.id: c for c in self._get_rows(
+                "natives", lambda: self.cg.markets(ids=native_ids, per_page=len(native_ids), sparkline=False), now)}
+
+        cache = d["mcache"]
+        keys = []
         for key, sc in self.cfg.sectors.items():
             cat = sc.get("category")
             if valid is not None and cat not in valid:
                 log.warning("فئة CoinGecko غير صالحة وتم تجاهلها: %s (%s)", key, cat)
                 continue
-            coins = self._universe(self.cg.markets(category=cat, per_page=per_page))
+            keys.append(key)
+        keys.sort(key=lambda k: cache.get(f"s:{k}", {}).get("ts", 0))  # الأقدم بيانات أولاً
+        sector_data: dict = {}
+        for key in keys:
+            cat = self.cfg.sectors[key].get("category")
+            coins = self._universe(self._get_rows(
+                f"s:{key}", lambda cat=cat: self.cg.markets(category=cat, per_page=per_page), now))
             if len(coins) >= 6:
                 sector_data[key] = coins
             else:
                 log.info("قطاع %s: بيانات غير كافية (%d)", key, len(coins))
 
-        native_ids = [e["native"] for e in self.cfg.ecosystems.values() if e.get("native")]
-        natives = {c.id: c for c in self.cg.markets(ids=native_ids, per_page=len(native_ids) or 1,
-                                                     sparkline=False)} if native_ids else {}
-        trending = self.cg.trending()
+        trending = self._trending(now)
 
         flows = self._bridge_flows(now)
-        stats, cands = sector_analyze(sector_data, self.cfg, self.att)
+        fresh_sectors = {k[2:] for k in self.fresh_keys if k.startswith("s:")}
+        stats, cands = sector_analyze(sector_data, self.cfg, self.att, fresh=fresh_sectors)
         self.summary["sectors"] = stats
 
         triggers = waterfall_detect(natives, self.cfg, flows, self.vr)
@@ -1371,7 +1509,8 @@ class Engine:
             if valid is not None and cat not in valid:
                 log.warning("فئة النظام البيئي غير صالحة: %s", cat)
                 continue
-            coins = self._universe(self.cg.markets(category=cat, per_page=per_page))
+            coins = self._universe(self._get_rows(
+                f"e:{t['key']}", lambda cat=cat: self.cg.markets(category=cat, per_page=per_page), now))
             cands += waterfall_scan(t, coins, self.cfg, self.vr)
         self.summary["triggers"] = [t["key"] for t in triggers]
 
@@ -1409,11 +1548,19 @@ class Engine:
         scored.sort(key=lambda x: x[0], reverse=True)
         self.summary["near_miss"] = [(round(s, 1), c.coin.symbol, sorted(c.kinds)) for s, c in scored[:6]]
         self.summary["threshold"] = round(threshold, 1)
+        self.summary["cg"] = {"fresh": len(self.fresh_keys), "tokens": round(d["cg"]["tokens"], 1),
+                              "used_month": d["cg"]["used"], "budget": self.budget.monthly}
 
         sent = 0
         for s, c in scored:
             if s < threshold or sent >= int(self.cfg.get("run.max_alerts_per_run")):
                 continue
+            fp = self._fresh_price(c)
+            if fp is not None:
+                if fp / c.coin.price - 1.0 > 0.04:  # صعدت أكثر من 4% منذ لقطة البيانات: فات الأوان
+                    log.info("skip %s: already moved %+.1f%% since snapshot", c.coin.symbol, (fp / c.coin.price - 1) * 100)
+                    continue
+                c.coin.price = fp
             levels = self._levels(c)
             text = format_signal(c, s, levels, self.cfg.get("run.timezone"))
             if self._send(text):
@@ -1591,7 +1738,14 @@ class Engine:
         prices: dict = {}
         cg_ids = sorted({s["src"]["id"] for s in open_sigs if s["src"].get("src") == "cg"})
         if cg_ids:
-            got = self.cg.prices(cg_ids)
+            try:
+                got = self.llama.coin_prices(cg_ids)
+            except Exception as exc:
+                log.warning("llama prices failed: %s", exc)
+                got = {}
+            missing = [i for i in cg_ids if i not in got]
+            if missing and self.budget.take():
+                got = {**got, **self.cg.prices(missing)}
             prices.update({f"cg:{k}": v for k, v in got.items()})
         by_chain: dict = {}
         for s in open_sigs:
@@ -1657,7 +1811,8 @@ class Engine:
         lines = ["📡 <b>الرادار يعمل</b>",
                  "أسخن القطاعات: " + " | ".join(f"{s['label'].split('·')[0].strip()} {s['heat']:+.1f}%" for s in top),
                  f"صفقات مفتوحة: {len(self.state.data['open'])} | مُقيَّمة: {n}"
-                 + (f" | نجاح: {wr * 100:.0f}%" if wr is not None else "")]
+                 + (f" | نجاح: {wr * 100:.0f}%" if wr is not None else ""),
+                 f"CoinGecko هذا الشهر: {self.state.data['cg']['used']}/{int(self.budget.monthly)} طلب"]
         if self._send("\n".join(lines)):
             meta["last_heartbeat"] = now
 
@@ -1701,10 +1856,15 @@ def build(dry_run: bool, state_path: str):
     token, chat = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
     if dry_run or not (token and chat):
         if not dry_run:
-            log.warning("بيانات تيليجرام غير موجودة -> وضع تجريبي (الرسائل تُطبع فقط)")
+            missing = [k for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not env.get(k)]
+            log.warning("الأسرار المفقودة: %s -> وضع تجريبي (الرسائل تُطبع فقط). "
+                        "أضفها في Settings > Secrets and variables > Actions > Repository secrets بنفس الاسم تماماً",
+                        ", ".join(missing))
         notifier = ConsoleNotifier()
     else:
         notifier = Telegram(http, token, chat)
+    if token and ":" not in token:
+        log.warning("TELEGRAM_BOT_TOKEN شكله غير صحيح (التوكن الصحيح يحوي نقطتين :)")
     state = State(state_path)
     engine = Engine(cfg, state, cg, DefiLlama(http), DexScreener(http), eth, sol, notifier, dry_run=dry_run)
     return cfg, http, state, engine, notifier
@@ -1756,8 +1916,19 @@ def cmd_test_telegram(args) -> int:
     if not (tok and chat):
         print("أضف TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID أولاً")
         return 1
-    ok = Telegram(http, tok, chat).send("✅ <b>رادار السيولة</b> — اختبار الاتصال ناجح")
-    print("تم الإرسال" if ok else "فشل الإرسال: تحقق من التوكن والـ chat id (وأرسل /start للبوت)")
+    tg = Telegram(http, tok, chat)
+    ok = tg.send("✅ <b>رادار السيولة</b> — اختبار الاتصال ناجح\nالرسالة التالية مثال لشكل التنبيه (ليست إشارة حقيقية).")
+    if ok:
+        coin = Coin("demo", "DEMO", "Demo Token", 1.2345, 5e7, 3e6, 0.8, -1.2, 3.0)
+        cand = Candidate(coin=coin, kinds={"whale", "waterfall"}, sectors=["مثال · RWA"], meta={"url": "https://www.coingecko.com"},
+                         reasons=[(0, "🐋 DWF Labs (مشتريات معلنة): تجميع $320K"),
+                                  (2, "🌊 شلال Solana: SOL +9.0% (24س) ← DEMO لم تتحرك بعد (-1.2%)"),
+                                  (3, "🔥 قطاع RWA ساخن +6.5% (اتساع 78%) والعملة متأخرة -1.2%"),
+                                  (6, "🟢 ضغط شراء على DEX: 70 شراء / 20 بيع (1س)")])
+        price = coin.price
+        tg.send(format_signal(cand, 74.0, {"target": price * 1.1, "stop": price * 0.94, "target_pct": 10.0,
+                                          "stop_pct": 6.0}, cfg.get("run.timezone")))
+    print("تم الإرسال" if ok else "فشل الإرسال: تحقق من التوكن والـ chat id (وأرسل /start للبوت أو أضف البوت مشرفاً في القناة)")
     return 0 if ok else 1
 
 
