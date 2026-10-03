@@ -2,17 +2,18 @@ name: Liquidity Radar
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"      # كل 10 دقائق (GitHub قد يؤخر التنفيذ بضع دقائق أحياناً)
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "تشغيل تجريبي (بدون تيليجرام)"
-        type: boolean
-        default: false
-      test_telegram:
-        description: "إرسال رسالة اختبار تيليجرام فقط"
-        type: boolean
-        default: false
+      mode:
+        description: "نمط التشغيل اليدوي"
+        type: choice
+        default: dry_run
+        options:
+          - dry_run          # تشغيلة تجريبية بدون تيليجرام
+          - run              # تشغيلة حقيقية
+          - selftest         # التحقق الذاتي من الكود + فحص المزوّدين
+          - test_telegram    # رسائل اختبار بشكل التنبيهات
 
 permissions:
   contents: read
@@ -26,6 +27,14 @@ jobs:
   radar:
     runs-on: ubuntu-latest
     timeout-minutes: 9
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+      COINGECKO_PLAN: ${{ secrets.COINGECKO_PLAN }}
+      ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+      SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,23 +53,17 @@ jobs:
           restore-keys: |
             radar-state-
 
+      - name: Self-test
+        if: ${{ inputs.mode == 'selftest' }}
+        run: python radar.py selftest
+
       - name: Test Telegram
-        if: ${{ inputs.test_telegram }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        if: ${{ inputs.mode == 'test_telegram' }}
         run: python radar.py test-telegram
 
       - name: Run radar
-        if: ${{ !inputs.test_telegram }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          COINGECKO_PLAN: ${{ secrets.COINGECKO_PLAN }}
-          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
-          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
-        run: python radar.py run ${{ inputs.dry_run && '--dry-run' || '' }}
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'run' || inputs.mode == 'dry_run' }}
+        run: python radar.py run ${{ inputs.mode == 'dry_run' && '--dry-run' || '' }}
 
       - name: Save state
         if: always()
