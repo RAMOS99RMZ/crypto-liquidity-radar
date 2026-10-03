@@ -1,16 +1,17 @@
 # ============================================================
 #  config.yaml — كل إعدادات رادار شلال السيولة في ملف واحد
-#  الأقسام: العتبات ← القطاعات ← الأنظمة البيئية (داخل whales: المنصات والمحافظ)
 #  حافظ على المسافات (Indentation) كما هي عند التعديل.
+#  للتحقق بعد أي تعديل:  python radar.py selftest
 # ============================================================
 
 run:
   timezone: "Europe/Istanbul"   # توقيت العرض داخل رسائل تيليجرام
   min_score: 58                 # الحد الأدنى لقوة الإشارة (0-100). يتكيّف تلقائياً مع نتائج التعلّم
-  max_alerts_per_run: 3         # أقصى عدد تنبيهات في التشغيلة الواحدة
+  max_alerts_per_run: 3         # أقصى عدد تنبيهات شراء في التشغيلة الواحدة
   cooldown_hours: 12            # لا يُعاد تنبيه نفس العملة قبل مرور هذه المدة
   heartbeat_hours: 24           # رسالة "الرادار يعمل" كل N ساعة (0 = تعطيل)
-  notify_outcomes: true         # إرسال نتيجة كل صفقة (هدف/وقف) عند إغلاقها
+  notify_outcomes: true         # إرسال نتيجة كل صفقة عند إغلاقها
+  notify_errors: true           # إرسال تقرير أخطاء التشغيل (مرة كل 6 ساعات كحد أقصى)
   dex_confirm_top: 8            # عدد المرشحين الذين يُفحصون على DEX/On-Chain في كل تشغيلة
 
 universe:
@@ -23,8 +24,14 @@ gates:                          # بوابات "قبل الانفجار": نست
   max_coin_24h: 12.0            # % أقصى صعود 24س مسموح للعملة المرشحة
   max_coin_1h: 5.0              # % أقصى صعود 1س
 
+live:                           # الطبقة اللحظية: أسعار البورصات العامة (بلا مفتاح وبلا سقف شهري)
+  enabled: true
+  exchanges: [binance_vision, mexc, gate, kucoin]   # ترتيب المحاولة (Binance.com محجوبة من خوادم GitHub)
+  match_tolerance: 0.12         # أقصى فرق سعر بين CoinGecko والبورصة لقبول تطابق الرمز
+  snapshot_hours: 3             # مدة حفظ لقطات الأسعار لحساب تغير الساعة
+
 sector:                         # مصفوفة تدوير القطاعات
-  hot_heat: 4.0                 # % حرارة القطاع لاعتباره "ساخناً"
+  hot_heat: 4.0                 # % حرارة القطاع لاعتباره "ساخناً" (يُستبدل بالقيمة المضبوطة من الاختبار الرجعي)
   min_breadth: 0.55             # نسبة العملات الصاعدة داخل القطاع
   laggard_gap: 4.0              # % الفجوة بين القطاع والعملة المتأخرة
   laggard_max_24h: 6.0          # % أقصى أداء 24س للعملة "المتأخرة"
@@ -34,31 +41,61 @@ sector:                         # مصفوفة تدوير القطاعات
 waterfall:                      # شلال السيولة البيئي
   native_24h: 5.0               # % صعود العملة الأم خلال 24س لتفعيل الفحص
   native_1h: 2.0                # % صعود العملة الأم خلال ساعة
-  max_triggers: 3               # أقصى عدد شبكات تُفحص لكل تشغيلة (حماية حدود API)
+  max_triggers: 3               # أقصى عدد شبكات تُفحص لكل تشغيلة
   min_corr: 0.30
   laggard_gap: 3.0
 
 attention:                      # زخم الانتباه
   alpha: 0.02                   # سرعة تعلّم خط الأساس (EWMA)
   warmup_runs: 12               # عدد التشغيلات قبل اعتبار خط الأساس جاهزاً (~ساعتان)
-  trending_penalty: 8           # خصم نقاط إذا كانت العملة Trending أصلاً (جمهور التجزئة سبقنا)
+  trending_penalty: 8           # خصم نقاط إذا كانت العملة Trending أصلاً (الجمهور سبقنا)
 
-bridge:                         # جسور العبور / تدفق السيولة للشبكات
-  min_stable_inflow_usd_6h: 30000000   # تدفق عملات مستقرة صافٍ للشبكة خلال 6س
-  min_stable_inflow_pct_6h: 0.5        # % من المعروض المستقر للشبكة
+bridge:                         # تدفق السيولة للشبكات (مستقرات)
+  min_stable_inflow_usd_6h: 30000000
+  min_stable_inflow_pct_6h: 0.5
   history_hours: 48
 
-whales:                         # تتبع المحافظ (يحتاج مفتاح Etherscan و/أو محافظ في هذا الملف (قسم whales.wallets))
+targets:                        # الأهداف الواقعية (مقاومات + جدران بيع + سيولة + تاريخ)
+  min_t1_pct: 3.0               # أقل مسافة للهدف الأول
+  max_target_pct: 120.0         # أقصى هدف ممكن (الصعود قد يتجاوز 100% عند سيولة ضخمة ودفتر رقيق)
+  wall_min_usd: 40000           # أقل قيمة لتجمّع أوامر بيع/شراء يُعتبر جداراً
+  wall_vs_volume: 0.02          # أو نسبة من حجم 24س (الأكبر منهما)
+  wall_band_pct: 0.6            # عرض نطاق تجميع الأوامر %
+  depth_limit: 100              # عدد مستويات دفتر الأوامر
+  orderbook_top: 4              # أقصى عدد دفاتر أوامر تُفحص في كل تشغيلة
+  flow_share: 0.25              # حصة من حجم 24س تُعتبر تدفق شراء صافياً مقدّراً
+  stop_atr_mult: 1.2            # مضاعف التذبذب للوقف عند غياب دعم هيكلي
+
+risk:                           # حدود الوقف وإدارة الصفقة
+  default_daily_vol: 6.0
+  stop_min: 4.0
+  stop_max: 12.0
+  rr: 1.8                       # يُستخدم في الاختبار الرجعي
+  horizon_hours: 36             # مهلة الصفقة التي لم تبلغ T1
+
+positions:                      # إدارة الصفقات المفتوحة
+  trail_after_t1: true          # نقل الوقف لنقطة الدخول بعد T1 وإلى T1 بعد T2
+  max_hold_hours: 72            # أقصى مدة للصفقة الرابحة
+  momentum_break_pct: 3.5       # تراجع % عن قمة الصفقة يُطلق تحذير ضعف الزخم
+
+distribution:                   # كشف التصريف
+  enabled: true
+  warn_cooldown_hours: 6
+  max_warnings_per_run: 3
+  exchange_inflow_usd: 150000   # إيداع حوت في منصة بهذه القيمة = تحذير
+  climax_24h: 15.0              # % صعود 24س يُعتبر ذروة
+  climax_pullback_1h: -1.5      # % انعكاس ساعة بعد الذروة
+  climax_vol_ratio: 2.0         # ضعف حجم التداول المعتاد
+
+whales:                         # تتبع الحيتان (EVM عبر Etherscan/Blockscout + Solana)
   min_usd: 100000               # أقل قيمة حركة لتعتبر "حوتاً"
   min_liquidity: 250000         # أقل سيولة للعملة (فلتر ضد عملات السبام)
   first_run_lookback_min: 60
-  max_wallets: 25
+  max_wallets: 40
   sell_block_usd: 250000        # إذا أودع الحيتان هذه القيمة في منصة → نمنع التنبيه
-  token_flow_check: true        # فحص تدفق المنصات (Inflow/Outflow) على عقد العملة نفسها
+  token_flow_check: true        # فحص Inflow/Outflow المنصات على عقد العملة نفسها
 
-  # ---------- عناوين المنصات (لاكتشاف Exchange Inflow / Outflow) ----------
-  # كلها موسومة على Etherscan Labels (تم التحقق منها). المنصات الكبرى تملك عناوين كثيرة،
-  # لذلك التغطية جزئية. أضف المزيد من Etherscan (أي عنوان عليه وسم Exchange).
+  # ---------- عناوين المنصات (كلها موسومة على Etherscan Labels) ----------
   exchanges:
     "Binance 14":          "0x28c6c06298d514db089934071355e5743bf21d60"
     "Binance Hot Wallet":  "0xdfd5293d8e347dfe59e90efd55b2956a1343963d"
@@ -66,26 +103,34 @@ whales:                         # تتبع المحافظ (يحتاج مفتاح
     "Bybit Hot Wallet":    "0xf89d7b9c864f589bbf53a82105107622b35eaa40"
 
   # ---------- محافظ الحيتان / صناع السوق / الصناديق ----------
-  # weight = وزن الثقة بالإشارة (0-1). محافظ صناع السوق تتداول باستمرار فإشاراتها أضعف.
-  # EOA يمكن أن يكون نفس العنوان على عدة شبكات EVM: كل شبكة تحتاج سطراً مستقلاً.
-  # ملاحظة: شبكات base و bsc قد لا تكون متاحة في الخطة المجانية لـ Etherscan؛ إن لم تعمل تُتجاهل تلقائياً.
+  # weight = وزن الثقة (0-1). شبكات الدعم المجاني: ethereum, arbitrum, polygon (Etherscan/Blockscout)،
+  # base, optimism (Blockscout)، solana (RPC). شبكة bsc غير مدعومة مجاناً حالياً.
+  # يُضاف إليها تلقائياً "المحافظ المكتشفة" (قسم discovery) بعد تكرارها مع صفقات رابحة.
   wallets:
-    # --- DWF Labs: عنوان أعلنه DWF رسمياً لمشترياته من السوق الثانوي (أقوى إشارة هنا) ---
     - {label: "DWF Labs (مشتريات معلنة)", chain: ethereum, address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
-    # (معطّل: Etherscan المجاني لا يدعم bsc) - {label: "DWF Labs (مشتريات معلنة)", chain: bsc,      address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
-    # (معطّل: Etherscan المجاني لا يدعم base) - {label: "DWF Labs (مشتريات معلنة)", chain: base,     address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
+    - {label: "DWF Labs (مشتريات معلنة)", chain: base,     address: "0xF0984860f1F31a784c0FF0bb4d1322e377f97631", weight: 1.0}
     - {label: "DWF Labs (مشتريات معلنة)", chain: solana,   address: "HwDkuDCUipJHHKodBBCjffFvrjhmd4iVVh7fq25fShvt", weight: 1.0}
-    # --- DWF Labs: عناوين موسومة على Etherscan ---
     - {label: "DWF Labs", chain: ethereum, address: "0xD4B69e8D62C880E9DD55d419d5E07435C3538342", weight: 0.7}
     - {label: "DWF Labs", chain: ethereum, address: "0xddAcAd3B1edee8E2F5b2e84f658202534fcb0374", weight: 0.7}
-    # --- a16z ---
-    - {label: "a16z",                   chain: ethereum, address: "0x05E793cE0C6027323Ac150F6d45C2344d28B6019", weight: 0.9}   # وسم Etherscan
-    - {label: "a16z (منسوب، غير مؤكد)", chain: ethereum, address: "0xb5E4d21240e9356caFc3a1261d10383f62DFc24e", weight: 0.7}   # نسبه Lookonchain/Arkham ولم تؤكده a16z
-    # --- Wintermute (صانع سوق: نشاط مرتفع دائم، وزن منخفض) ---
+    - {label: "a16z",                   chain: ethereum, address: "0x05E793cE0C6027323Ac150F6d45C2344d28B6019", weight: 0.9}
+    - {label: "a16z (منسوب، غير مؤكد)", chain: ethereum, address: "0xb5E4d21240e9356caFc3a1261d10383f62DFc24e", weight: 0.7}
     - {label: "Wintermute",   chain: ethereum, address: "0xDBF5E9c5206d0dB70a90108bf936DA60221dC080", weight: 0.5}
     - {label: "Wintermute 2", chain: ethereum, address: "0x000002Cba8DfB0a86A47a415592835E17fac080a", weight: 0.4}
-    # --- Jump Trading ---
     - {label: "Jump Trading", chain: ethereum, address: "0xf584F8728B874a6a5c7A8d4d387C9aae9172D621", weight: 0.6}
+
+discovery:                      # اكتشاف المحافظ الذكية تلقائياً من أوائل مشتري العملات الرابحة (إيثريوم + مفتاح Etherscan)
+  enabled: true
+  min_usd: 50000                # أقل صافي شراء مبكر
+  min_hits: 2                   # عدد العملات الرابحة التي تكرر فيها العنوان ليُضاف للمراقبة
+  max_wallets: 12
+  weight: 0.6
+
+context:                        # سياق: أخبار RSS + تغيّر TVL + مراجعة ذكية اختيارية
+  news_hours: 24
+  llm:
+    enabled: auto               # auto = يعمل فقط إذا وُجد ANTHROPIC_API_KEY (مدفوع الاستخدام)
+    model: claude-haiku-4-5-20251001
+    max_calls_per_run: 2        # فقط للإشارات التي تجاوزت الحد الأدنى
 
 dex:                            # تأكيد DexScreener
   min_liquidity: 150000
@@ -93,25 +138,28 @@ dex:                            # تأكيد DexScreener
   identity_high: 3.0
   min_txns_h1: 20
 
-risk:                           # حساب الهدف والوقف (متكيّف مع تذبذب العملة)
-  default_daily_vol: 6.0
-  stop_min: 4.0
-  stop_max: 12.0
-  rr: 1.8                       # نسبة العائد/المخاطرة
-  horizon_hours: 36             # بعدها تُغلق الصفقة للتقييم
-
 learning:                       # التعلّم الذاتي
-  min_samples: 30               # عدد الصفقات المُقيَّمة قبل أن يبدأ النموذج بالتأثير
-  max_alpha: 0.7                # أقصى وزن للنموذج المتعلَّم مقابل الأوزان الأولية
+  min_samples: 30
+  max_alpha: 0.7
   alpha_k: 60
   lr: 0.05
   l2: 0.01
-  win_window: 30                # نافذة حساب نسبة النجاح الأخيرة لتكييف الحد الأدنى
+  win_window: 30
+
+backtest:                       # الاختبار الرجعي (python radar.py backtest) ويعمل أسبوعياً من Actions
+  candles: 1000                 # عدد شموع الساعة لكل عملة
+  pages: 2                      # صفحات (Binance/MEXC فقط) لزيادة العمق
+  top_per_group: 25
+  horizon_hours: 36
+  min_trades: 30
+  apply_tuned: true             # تطبيق العتبات المضبوطة تلقائياً إن أثبت الاختبار ميزة إحصائية
 
 coingecko:                      # ميزانية الطلبات (الخطة المجانية Demo = 10,000 طلب/شهر فقط!)
-  monthly_budget: 9000          # اترك هامشاً تحت 10,000. الرادار يوزّعها تلقائياً ويعمل على الكاش عند النفاد
-  min_refresh_minutes: 20       # لا يُحدَّث قطاع أحدث من هذه المدة
-  max_cache_age_hours: 6        # أقدم بيانات كاش مسموح استخدامها
+  monthly_budget: 8500          # هامش أمان تحت 10,000. الرادار يوزّعها تلقائياً ويعمل على الكاش عند النفاد
+  refresh_minutes_live: 720     # مع الطبقة اللحظية: بنية القطاعات تتجدد كل 12 ساعة (الأسعار لحظية من البورصة)
+  refresh_minutes_nolive: 90    # بدون بورصات: تجديد كل 90 دقيقة قدر الميزانية
+  max_cache_age_hours_live: 48
+  max_cache_age_hours_nolive: 12
   trending_refresh_minutes: 60
   retry_after_fail_minutes: 15  # بعد فشل/429 لا نعيد المحاولة قبل هذه المدة
 
@@ -120,28 +168,67 @@ network:
   coingecko_interval_key: 2.2   # ثواني بين الطلبات مع مفتاح Demo
 
 # ---------------- القطاعات (سلات) ----------------
+# category = معرّف الفئة في CoinGecko. المعرّفات غير الصحيحة تُتجاهل تلقائياً مع تحذير؛
+# شغّل  python radar.py check  لترى أيها صالح. أضف أي قطاع جديد بنفس الصيغة.
 sectors:
-  rwa:      {label: "RWA · الأصول الحقيقية",  category: real-world-assets-rwa}
-  zk:       {label: "ZK · المعرفة الصفرية",   category: zero-knowledge-zk}
-  ai:       {label: "AI · الذكاء الاصطناعي",  category: artificial-intelligence}
-  depin:    {label: "DePIN · البنية اللامركزية", category: depin}
-  defi:     {label: "DeFi · التمويل اللامركزي", category: decentralized-finance-defi}
-  l1:       {label: "Layer 1 · الشبكات الجديدة", category: layer-1}
-  l2:       {label: "Layer 2 · طبقة ثانية",   category: layer-2}
-  meme:     {label: "Meme · الميم",           category: meme-token}
-  gaming:   {label: "Gaming · الألعاب",       category: gaming}
-  oracle:   {label: "Oracle · الأوراكل",      category: oracle}
-  privacy:  {label: "Privacy · الخصوصية",     category: privacy-coins}
+  l1:          {label: "Layer 1 · الشبكات الأساسية",   category: layer-1}
+  l2:          {label: "Layer 2 · الطبقة الثانية",     category: layer-2}
+  l0:          {label: "Layer 0 · ربط الشبكات",        category: layer-0-l0}
+  modular:     {label: "Modular · الشبكات المعيارية",  category: modular-blockchain}
+  zk:          {label: "ZK · المعرفة الصفرية",         category: zero-knowledge-zk}
+  smart:       {label: "Smart Contract Platforms",     category: smart-contract-platform}
+  infra:       {label: "Infrastructure · البنية",      category: infrastructure}
+  interop:     {label: "Interoperability · الجسور",    category: cross-chain-communication}
+  oracle:      {label: "Oracle · الأوراكل",            category: oracle}
+  storage:     {label: "Storage · التخزين",            category: storage}
+  depin:       {label: "DePIN · البنية اللامركزية",    category: depin}
+  iot:         {label: "IoT · إنترنت الأشياء",         category: internet-of-things-iot}
+  defi:        {label: "DeFi · التمويل اللامركزي",     category: decentralized-finance-defi}
+  dex:         {label: "DEX · البورصات اللامركزية",    category: decentralized-exchange}
+  lending:     {label: "Lending · الإقراض",            category: lending-borrowing}
+  yield:       {label: "Yield · العوائد",              category: yield-aggregator}
+  derivatives: {label: "Derivatives · المشتقات",       category: derivatives}
+  perps:       {label: "Perps · العقود الدائمة",       category: perpetuals}
+  lst:         {label: "Liquid Staking · التخزين السائل", category: liquid-staking-governance-tokens}
+  restaking:   {label: "Restaking · إعادة الرهن",      category: restaking}
+  rwa:         {label: "RWA · الأصول الحقيقية",        category: real-world-assets-rwa}
+  tokenstocks: {label: "Tokenized Stocks · الأسهم المرمّزة", category: tokenized-stocks}
+  ai:          {label: "AI · الذكاء الاصطناعي",        category: artificial-intelligence}
+  agents:      {label: "AI Agents · وكلاء الذكاء",     category: ai-agents}
+  aiapps:      {label: "AI Apps · تطبيقات الذكاء",     category: ai-applications}
+  meme:        {label: "Meme · الميم",                 category: meme-token}
+  dogs:        {label: "Dog Memes · ميم الكلاب",       category: dog-themed-coins}
+  cats:        {label: "Cat Memes · ميم القطط",        category: cat-themed-coins}
+  aimeme:      {label: "AI Memes",                     category: ai-meme-coins}
+  gaming:      {label: "Gaming · الألعاب",             category: gaming}
+  p2e:         {label: "Play-to-Earn",                 category: play-to-earn}
+  metaverse:   {label: "Metaverse · الميتافيرس",       category: metaverse}
+  nft:         {label: "NFT",                          category: non-fungible-tokens-nft}
+  socialfi:    {label: "SocialFi · الاجتماعية",        category: socialfi}
+  privacy:     {label: "Privacy · الخصوصية",           category: privacy-coins}
+  prediction:  {label: "Prediction Markets · التنبؤات", category: prediction-markets}
+  btcfi:       {label: "Bitcoin Ecosystem · نظام بيتكوين", category: bitcoin-ecosystem}
+  brc20:       {label: "BRC-20",                       category: brc-20}
+  cex:         {label: "Exchange Tokens · عملات المنصات", category: exchange-based-tokens}
+  launchpad:   {label: "Launchpad · منصات الإطلاق",    category: launchpad}
+  fan:         {label: "Fan Tokens · عملات المشجعين",  category: fan-token}
+  identity:    {label: "Identity · الهوية",            category: identity}
+  analytics:   {label: "Analytics · التحليلات",        category: analytics}
+  payments:    {label: "Payments · المدفوعات",         category: payment-solutions}
+  gambling:    {label: "Gambling · المراهنات",         category: gambling}
+  realestate:  {label: "Real Estate · العقارات",       category: real-estate}
+  energy:      {label: "Energy · الطاقة",              category: energy}
 
-# native   = معرّف العملة الأم في CoinGecko (اتركه null إن لم توجد عملة أم مثل Base)
+# native   = معرّف العملة الأم في CoinGecko (null إن لم توجد عملة أم مثل Base)
 # category = فئة النظام البيئي في CoinGecko
-# chain    = اسم الشبكة في DefiLlama (لتتبع تدفق العملات المستقرة/الجسور)
+# chain    = اسم الشبكة في DefiLlama (لتتبع تدفق العملات المستقرة)
 ecosystems:
   solana:      {label: "Solana",      native: solana,                   category: solana-ecosystem,        chain: Solana}
   sui:         {label: "Sui",         native: sui,                      category: sui-ecosystem,           chain: Sui}
   ethereum:    {label: "Ethereum",    native: ethereum,                 category: ethereum-ecosystem,      chain: Ethereum}
   base:        {label: "Base",        native: null,                     category: base-ecosystem,          chain: Base}
   arbitrum:    {label: "Arbitrum",    native: arbitrum,                 category: arbitrum-ecosystem,      chain: Arbitrum}
+  optimism:    {label: "Optimism",    native: optimism,                 category: optimism-ecosystem,      chain: "OP Mainnet"}
   avalanche:   {label: "Avalanche",   native: avalanche-2,              category: avalanche-ecosystem,     chain: Avalanche}
   bnb:         {label: "BNB Chain",   native: binancecoin,              category: binance-smart-chain,     chain: BSC}
   near:        {label: "NEAR",        native: near,                     category: near-protocol-ecosystem, chain: Near}
@@ -149,4 +236,13 @@ ecosystems:
   ton:         {label: "TON",         native: the-open-network,         category: ton-ecosystem,           chain: TON}
   tron:        {label: "Tron",        native: tron,                     category: tron-ecosystem,          chain: Tron}
   polygon:     {label: "Polygon",     native: polygon-ecosystem-token,  category: polygon-ecosystem,       chain: Polygon}
+  cardano:     {label: "Cardano",     native: cardano,                  category: cardano-ecosystem,       chain: Cardano}
+  polkadot:    {label: "Polkadot",    native: polkadot,                 category: polkadot-ecosystem,      chain: Polkadot}
+  cosmos:      {label: "Cosmos",      native: cosmos,                   category: cosmos-ecosystem,        chain: Cosmos}
+  sei:         {label: "Sei",         native: sei-network,              category: sei-ecosystem,           chain: Sei}
+  injective:   {label: "Injective",   native: injective-protocol,       category: injective-ecosystem,     chain: Injective}
+  mantle:      {label: "Mantle",      native: mantle,                   category: mantle-ecosystem,        chain: Mantle}
+  sonic:       {label: "Sonic",       native: sonic-3,                  category: sonic-ecosystem,         chain: Sonic}
+  berachain:   {label: "Berachain",   native: berachain-bera,           category: berachain-ecosystem,     chain: Berachain}
+  linea:       {label: "Linea",       native: null,                     category: linea-ecosystem,         chain: Linea}
   hyperliquid: {label: "Hyperliquid", native: hyperliquid,              category: hyperliquid-ecosystem,   chain: "Hyperliquid L1"}
