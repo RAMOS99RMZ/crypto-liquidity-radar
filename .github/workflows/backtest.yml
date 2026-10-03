@@ -1,0 +1,48 @@
+name: Backtest and Knowledge
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"        # أسبوعياً: الأحد 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write               # لحفظ knowledge.json في المستودع
+
+concurrency:
+  group: liquidity-radar-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+      COINGECKO_PLAN: ${{ secrets.COINGECKO_PLAN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Self-test
+        run: python radar.py selftest --offline
+
+      - name: Backtest (build knowledge.json)
+        run: python radar.py backtest
+
+      - name: Commit knowledge
+        run: |
+          if [ -f knowledge.json ] && [ -n "$(git status --porcelain knowledge.json)" ]; then
+            git config user.name "radar-bot"
+            git config user.email "radar-bot@users.noreply.github.com"
+            git add knowledge.json
+            git commit -m "update knowledge.json"
+            git push
+          else
+            echo "no changes"
+          fi
