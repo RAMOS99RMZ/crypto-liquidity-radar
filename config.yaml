@@ -4,14 +4,48 @@
 #  للتحقق بعد أي تعديل:  python radar.py selftest
 # ============================================================
 
+data_source: auto               # auto = CoinGecko إن وُجد مفتاح، وإلا CoinPaprika المجاني (بلا مفتاح)  | coingecko | paprika
+
+paprika:                        # المصدر المجاني: 20,000 طلب/شهر (نستهلك ~4,500)
+  monthly_budget: 17000
+
+rotation:                       # توقع انتقال السيولة داخل القطاع وبين القطاعات
+  enabled: true
+  min_source_heat: 4.0          # أدنى حرارة للقطاع المصدر
+  min_conf: 0.25                # أدنى ثقة لإرسال توقع
+  window_low: 0.5               # نافذة الانتقال المعتادة = lag × [0.5 , 2]
+  window_high: 2.0
+  max_alerts_per_run: 2
+  cooldown_hours: 8
+  max_coins: 4
+  prior_lag_h: 12               # تأخر افتراضي عام عند غياب المعرفة التاريخية
+  prior_corr: 0.2
+  prior_pairs:                  # ترتيب افتراضي عام (يُستبدل تلقائياً بنتائج backtest)
+    - [l1, l2]
+    - [l1, defi]
+    - [l2, defi]
+    - [defi, ai]
+    - [rwa, defi]
+    - [ai, agents]
+    - [ai, depin]
+    - [ai, aimeme]
+    - [defi, gaming]
+    - [gaming, metaverse]
+    - [gaming, nft]
+    - [l1, meme]
+    - [meme, dogs]
+    - [meme, cats]
+    - [oracle, defi]
+
 run:
+  time_budget_sec: 420          # سقف زمن التشغيلة؛ بعده يتوقف الجلب الثقيل ويُحفظ كل شيء (المهلة الصارمة 9 دقائق)
+  notify_errors: true           # رسالة تيليجرام عند حدوث أخطاء داخلية (مرة كل 6 ساعات)
   timezone: "Europe/Istanbul"   # توقيت العرض داخل رسائل تيليجرام
   min_score: 58                 # الحد الأدنى لقوة الإشارة (0-100). يتكيّف تلقائياً مع نتائج التعلّم
   max_alerts_per_run: 3         # أقصى عدد تنبيهات شراء في التشغيلة الواحدة
   cooldown_hours: 12            # لا يُعاد تنبيه نفس العملة قبل مرور هذه المدة
   heartbeat_hours: 24           # رسالة "الرادار يعمل" كل N ساعة (0 = تعطيل)
   notify_outcomes: true         # إرسال نتيجة كل صفقة عند إغلاقها
-  notify_errors: true           # إرسال تقرير أخطاء التشغيل (مرة كل 6 ساعات كحد أقصى)
   dex_confirm_top: 8            # عدد المرشحين الذين يُفحصون على DEX/On-Chain في كل تشغيلة
 
 universe:
@@ -26,6 +60,7 @@ gates:                          # بوابات "قبل الانفجار": نست
 
 live:                           # الطبقة اللحظية: أسعار البورصات العامة (بلا مفتاح وبلا سقف شهري)
   enabled: true
+  klines_per_run: 45            # شموع تُجلب في كل تشغيلة لبناء الارتباط (الوضع المجاني)، القطاعات الأسخن أولاً
   exchanges: [binance_vision, mexc, gate, kucoin]   # ترتيب المحاولة (Binance.com محجوبة من خوادم GitHub)
   match_tolerance: 0.12         # أقصى فرق سعر بين CoinGecko والبورصة لقبول تطابق الرمز
   snapshot_hours: 3             # مدة حفظ لقطات الأسعار لحساب تغير الساعة
@@ -168,81 +203,82 @@ network:
   coingecko_interval_key: 2.2   # ثواني بين الطلبات مع مفتاح Demo
 
 # ---------------- القطاعات (سلات) ----------------
-# category = معرّف الفئة في CoinGecko. المعرّفات غير الصحيحة تُتجاهل تلقائياً مع تحذير؛
-# شغّل  python radar.py check  لترى أيها صالح. أضف أي قطاع جديد بنفس الصيغة.
+# category = معرّف CoinGecko (يُستخدم عند وجود مفتاح CoinGecko)
+# tags     = كلمات تطابق أسماء وسوم CoinPaprika (الوضع المجاني بلا مفتاح)
+# llama    = فئات DefiLlama (تضيف بروتوكولات القطاع تلقائياً من TVL)
+# شغّل  python radar.py check  لترى الوسوم المطابقة لكل قطاع وعدد عملاته، وعدّل الكلمات إن لزم.
 sectors:
-  l1:          {label: "Layer 1 · الشبكات الأساسية",   category: layer-1}
-  l2:          {label: "Layer 2 · الطبقة الثانية",     category: layer-2}
-  l0:          {label: "Layer 0 · ربط الشبكات",        category: layer-0-l0}
-  modular:     {label: "Modular · الشبكات المعيارية",  category: modular-blockchain}
-  zk:          {label: "ZK · المعرفة الصفرية",         category: zero-knowledge-zk}
-  smart:       {label: "Smart Contract Platforms",     category: smart-contract-platform}
-  infra:       {label: "Infrastructure · البنية",      category: infrastructure}
-  interop:     {label: "Interoperability · الجسور",    category: cross-chain-communication}
-  oracle:      {label: "Oracle · الأوراكل",            category: oracle}
-  storage:     {label: "Storage · التخزين",            category: storage}
-  depin:       {label: "DePIN · البنية اللامركزية",    category: depin}
-  iot:         {label: "IoT · إنترنت الأشياء",         category: internet-of-things-iot}
-  defi:        {label: "DeFi · التمويل اللامركزي",     category: decentralized-finance-defi}
-  dex:         {label: "DEX · البورصات اللامركزية",    category: decentralized-exchange}
-  lending:     {label: "Lending · الإقراض",            category: lending-borrowing}
-  yield:       {label: "Yield · العوائد",              category: yield-aggregator}
-  derivatives: {label: "Derivatives · المشتقات",       category: derivatives}
-  perps:       {label: "Perps · العقود الدائمة",       category: perpetuals}
-  lst:         {label: "Liquid Staking · التخزين السائل", category: liquid-staking-governance-tokens}
-  restaking:   {label: "Restaking · إعادة الرهن",      category: restaking}
-  rwa:         {label: "RWA · الأصول الحقيقية",        category: real-world-assets-rwa}
-  tokenstocks: {label: "Tokenized Stocks · الأسهم المرمّزة", category: tokenized-stocks}
-  ai:          {label: "AI · الذكاء الاصطناعي",        category: artificial-intelligence}
-  agents:      {label: "AI Agents · وكلاء الذكاء",     category: ai-agents}
-  aiapps:      {label: "AI Apps · تطبيقات الذكاء",     category: ai-applications}
-  meme:        {label: "Meme · الميم",                 category: meme-token}
-  dogs:        {label: "Dog Memes · ميم الكلاب",       category: dog-themed-coins}
-  cats:        {label: "Cat Memes · ميم القطط",        category: cat-themed-coins}
-  aimeme:      {label: "AI Memes",                     category: ai-meme-coins}
-  gaming:      {label: "Gaming · الألعاب",             category: gaming}
-  p2e:         {label: "Play-to-Earn",                 category: play-to-earn}
-  metaverse:   {label: "Metaverse · الميتافيرس",       category: metaverse}
-  nft:         {label: "NFT",                          category: non-fungible-tokens-nft}
-  socialfi:    {label: "SocialFi · الاجتماعية",        category: socialfi}
-  privacy:     {label: "Privacy · الخصوصية",           category: privacy-coins}
-  prediction:  {label: "Prediction Markets · التنبؤات", category: prediction-markets}
-  btcfi:       {label: "Bitcoin Ecosystem · نظام بيتكوين", category: bitcoin-ecosystem}
-  brc20:       {label: "BRC-20",                       category: brc-20}
-  cex:         {label: "Exchange Tokens · عملات المنصات", category: exchange-based-tokens}
-  launchpad:   {label: "Launchpad · منصات الإطلاق",    category: launchpad}
-  fan:         {label: "Fan Tokens · عملات المشجعين",  category: fan-token}
-  identity:    {label: "Identity · الهوية",            category: identity}
-  analytics:   {label: "Analytics · التحليلات",        category: analytics}
-  payments:    {label: "Payments · المدفوعات",         category: payment-solutions}
-  gambling:    {label: "Gambling · المراهنات",         category: gambling}
-  realestate:  {label: "Real Estate · العقارات",       category: real-estate}
-  energy:      {label: "Energy · الطاقة",              category: energy}
+  l1: {label: "Layer 1 · الشبكات الأساسية", category: layer-1, tags: ["layer 1", "layer-1", "smart contracts", "blockchain service"]}
+  l2: {label: "Layer 2 · الطبقة الثانية", category: layer-2, tags: ["layer 2", "layer-2", "scaling", "rollup"]}
+  l0: {label: "Layer 0 · ربط الشبكات", category: layer-0-l0, tags: ["layer 0", "layer-0", "interoperability"]}
+  modular: {label: "Modular · الشبكات المعيارية", category: modular-blockchain, tags: ["modular", "data availability"]}
+  zk: {label: "ZK · المعرفة الصفرية", category: zero-knowledge-zk, tags: ["zero knowledge", "zk"]}
+  smart: {label: "Smart Contract Platforms", category: smart-contract-platform, tags: ["smart contracts"]}
+  infra: {label: "Infrastructure · البنية", category: infrastructure, tags: ["infrastructure", "blockchain service"]}
+  interop: {label: "Interoperability · الجسور", category: cross-chain-communication, tags: ["interoperability", "cross chain", "bridge"], llama: ["Bridge", "Cross Chain Bridge"]}
+  oracle: {label: "Oracle · الأوراكل", category: oracle, tags: ["oracle"], llama: ["Oracle"]}
+  storage: {label: "Storage · التخزين", category: storage, tags: ["storage"]}
+  depin: {label: "DePIN · البنية اللامركزية", category: depin, tags: ["depin", "decentralized physical"]}
+  iot: {label: "IoT · إنترنت الأشياء", category: internet-of-things-iot, tags: ["iot", "internet of things"]}
+  defi: {label: "DeFi · التمويل اللامركزي", category: decentralized-finance-defi, tags: ["defi", "decentralized finance"], llama: ["Dexs", "Lending", "Yield", "Yield Aggregator", "Liquid Staking", "Derivatives", "Options", "CDP"]}
+  dex: {label: "DEX · البورصات اللامركزية", category: decentralized-exchange, tags: ["dex", "decentralized exchange", "amm"], llama: ["Dexs"]}
+  lending: {label: "Lending · الإقراض", category: lending-borrowing, tags: ["lending"], llama: ["Lending", "CDP"]}
+  yield: {label: "Yield · العوائد", category: yield-aggregator, tags: ["yield"], llama: ["Yield", "Yield Aggregator", "Leveraged Farming"]}
+  derivatives: {label: "Derivatives · المشتقات", category: derivatives, tags: ["derivative"], llama: ["Derivatives", "Options"]}
+  perps: {label: "Perps · العقود الدائمة", category: perpetuals, tags: ["perp"], llama: ["Derivatives"]}
+  lst: {label: "Liquid Staking · التخزين السائل", category: liquid-staking-governance-tokens, tags: ["staking"], llama: ["Liquid Staking"]}
+  restaking: {label: "Restaking · إعادة الرهن", category: restaking, tags: ["restaking"], llama: ["Restaking", "Liquid Restaking"]}
+  rwa: {label: "RWA · الأصول الحقيقية", category: real-world-assets-rwa, tags: ["rwa", "real world", "tokenized"], llama: ["RWA", "RWA Lending"]}
+  tokenstocks: {label: "Tokenized Stocks · الأسهم المرمّزة", category: tokenized-stocks, tags: ["stock"]}
+  ai: {label: "AI · الذكاء الاصطناعي", category: artificial-intelligence, tags: ["ai", "artificial intelligence", "big data"]}
+  agents: {label: "AI Agents · وكلاء الذكاء", category: ai-agents, tags: ["agent"]}
+  aiapps: {label: "AI Apps · تطبيقات الذكاء", category: ai-applications, tags: ["ai application"]}
+  meme: {label: "Meme · الميم", category: meme-token, tags: ["meme"]}
+  dogs: {label: "Dog Memes · ميم الكلاب", category: dog-themed-coins, tags: ["dog", "doge"]}
+  cats: {label: "Cat Memes · ميم القطط", category: cat-themed-coins, tags: ["cat"]}
+  aimeme: {label: "AI Memes", category: ai-meme-coins, tags: ["ai meme"]}
+  gaming: {label: "Gaming · الألعاب", category: gaming, tags: ["gaming", "gamefi", "game"]}
+  p2e: {label: "Play-to-Earn", category: play-to-earn, tags: ["play to earn"]}
+  metaverse: {label: "Metaverse · الميتافيرس", category: metaverse, tags: ["metaverse"]}
+  nft: {label: "NFT", category: non-fungible-tokens-nft, tags: ["nft"]}
+  socialfi: {label: "SocialFi · الاجتماعية", category: socialfi, tags: ["social"]}
+  privacy: {label: "Privacy · الخصوصية", category: privacy-coins, tags: ["privacy"]}
+  prediction: {label: "Prediction Markets · التنبؤات", category: prediction-markets, tags: ["prediction"]}
+  btcfi: {label: "Bitcoin Ecosystem · نظام بيتكوين", category: bitcoin-ecosystem, tags: ["bitcoin ecosystem", "brc", "ordinals", "runes"]}
+  brc20: {label: "BRC-20", category: brc-20, tags: ["brc"]}
+  cex: {label: "Exchange Tokens · عملات المنصات", category: exchange-based-tokens, tags: ["exchange token"]}
+  launchpad: {label: "Launchpad · منصات الإطلاق", category: launchpad, tags: ["launchpad"]}
+  fan: {label: "Fan Tokens · عملات المشجعين", category: fan-token, tags: ["fan token"]}
+  identity: {label: "Identity · الهوية", category: identity, tags: ["identity"]}
+  analytics: {label: "Analytics · التحليلات", category: analytics, tags: ["analytic", "data"]}
+  payments: {label: "Payments · المدفوعات", category: payment-solutions, tags: ["payment"]}
+  gambling: {label: "Gambling · المراهنات", category: gambling, tags: ["gambling", "casino"]}
+  realestate: {label: "Real Estate · العقارات", category: real-estate, tags: ["real estate"]}
+  energy: {label: "Energy · الطاقة", category: energy, tags: ["energy"]}
 
-# native   = معرّف العملة الأم في CoinGecko (null إن لم توجد عملة أم مثل Base)
-# category = فئة النظام البيئي في CoinGecko
-# chain    = اسم الشبكة في DefiLlama (لتتبع تدفق العملات المستقرة)
+# native/symbol = العملة الأم (CoinGecko id / رمز للوضع المجاني)،  chain = اسم الشبكة في DefiLlama
+# tags = كلمات وسوم CoinPaprika، وعضوية النظام تُستكمل من بروتوكولات DefiLlama التي تعمل على الشبكة
 ecosystems:
-  solana:      {label: "Solana",      native: solana,                   category: solana-ecosystem,        chain: Solana}
-  sui:         {label: "Sui",         native: sui,                      category: sui-ecosystem,           chain: Sui}
-  ethereum:    {label: "Ethereum",    native: ethereum,                 category: ethereum-ecosystem,      chain: Ethereum}
-  base:        {label: "Base",        native: null,                     category: base-ecosystem,          chain: Base}
-  arbitrum:    {label: "Arbitrum",    native: arbitrum,                 category: arbitrum-ecosystem,      chain: Arbitrum}
-  optimism:    {label: "Optimism",    native: optimism,                 category: optimism-ecosystem,      chain: "OP Mainnet"}
-  avalanche:   {label: "Avalanche",   native: avalanche-2,              category: avalanche-ecosystem,     chain: Avalanche}
-  bnb:         {label: "BNB Chain",   native: binancecoin,              category: binance-smart-chain,     chain: BSC}
-  near:        {label: "NEAR",        native: near,                     category: near-protocol-ecosystem, chain: Near}
-  aptos:       {label: "Aptos",       native: aptos,                    category: aptos-ecosystem,         chain: Aptos}
-  ton:         {label: "TON",         native: the-open-network,         category: ton-ecosystem,           chain: TON}
-  tron:        {label: "Tron",        native: tron,                     category: tron-ecosystem,          chain: Tron}
-  polygon:     {label: "Polygon",     native: polygon-ecosystem-token,  category: polygon-ecosystem,       chain: Polygon}
-  cardano:     {label: "Cardano",     native: cardano,                  category: cardano-ecosystem,       chain: Cardano}
-  polkadot:    {label: "Polkadot",    native: polkadot,                 category: polkadot-ecosystem,      chain: Polkadot}
-  cosmos:      {label: "Cosmos",      native: cosmos,                   category: cosmos-ecosystem,        chain: Cosmos}
-  sei:         {label: "Sei",         native: sei-network,              category: sei-ecosystem,           chain: Sei}
-  injective:   {label: "Injective",   native: injective-protocol,       category: injective-ecosystem,     chain: Injective}
-  mantle:      {label: "Mantle",      native: mantle,                   category: mantle-ecosystem,        chain: Mantle}
-  sonic:       {label: "Sonic",       native: sonic-3,                  category: sonic-ecosystem,         chain: Sonic}
-  berachain:   {label: "Berachain",   native: berachain-bera,           category: berachain-ecosystem,     chain: Berachain}
-  linea:       {label: "Linea",       native: null,                     category: linea-ecosystem,         chain: Linea}
-  hyperliquid: {label: "Hyperliquid", native: hyperliquid,              category: hyperliquid-ecosystem,   chain: "Hyperliquid L1"}
+  solana: {label: "Solana", native: solana, symbol: SOL, category: solana-ecosystem, chain: "Solana", tags: ["solana"]}
+  sui: {label: "Sui", native: sui, symbol: SUI, category: sui-ecosystem, chain: "Sui", tags: ["sui"]}
+  ethereum: {label: "Ethereum", native: ethereum, symbol: ETH, category: ethereum-ecosystem, chain: "Ethereum", tags: ["ethereum"]}
+  base: {label: "Base", native: null, symbol: null, category: base-ecosystem, chain: "Base", tags: ["base"]}
+  arbitrum: {label: "Arbitrum", native: arbitrum, symbol: ARB, category: arbitrum-ecosystem, chain: "Arbitrum", tags: ["arbitrum"]}
+  optimism: {label: "Optimism", native: optimism, symbol: OP, category: optimism-ecosystem, chain: "OP Mainnet", tags: ["optimism"]}
+  avalanche: {label: "Avalanche", native: avalanche-2, symbol: AVAX, category: avalanche-ecosystem, chain: "Avalanche", tags: ["avalanche"]}
+  bnb: {label: "BNB Chain", native: binancecoin, symbol: BNB, category: binance-smart-chain, chain: "BSC", tags: ["bnb", "binance smart"]}
+  near: {label: "NEAR", native: near, symbol: NEAR, category: near-protocol-ecosystem, chain: "Near", tags: ["near protocol"]}
+  aptos: {label: "Aptos", native: aptos, symbol: APT, category: aptos-ecosystem, chain: "Aptos", tags: ["aptos"]}
+  ton: {label: "TON", native: the-open-network, symbol: TON, category: ton-ecosystem, chain: "TON", tags: ["ton"]}
+  tron: {label: "Tron", native: tron, symbol: TRX, category: tron-ecosystem, chain: "Tron", tags: ["tron"]}
+  polygon: {label: "Polygon", native: polygon-ecosystem-token, symbol: POL, category: polygon-ecosystem, chain: "Polygon", tags: ["polygon"]}
+  cardano: {label: "Cardano", native: cardano, symbol: ADA, category: cardano-ecosystem, chain: "Cardano", tags: ["cardano"]}
+  polkadot: {label: "Polkadot", native: polkadot, symbol: DOT, category: polkadot-ecosystem, chain: "Polkadot", tags: ["polkadot"]}
+  cosmos: {label: "Cosmos", native: cosmos, symbol: ATOM, category: cosmos-ecosystem, chain: "Cosmos", tags: ["cosmos"]}
+  sei: {label: "Sei", native: sei-network, symbol: SEI, category: sei-ecosystem, chain: "Sei", tags: ["sei"]}
+  injective: {label: "Injective", native: injective-protocol, symbol: INJ, category: injective-ecosystem, chain: "Injective", tags: ["injective"]}
+  mantle: {label: "Mantle", native: mantle, symbol: MNT, category: mantle-ecosystem, chain: "Mantle", tags: ["mantle"]}
+  sonic: {label: "Sonic", native: sonic-3, symbol: S, category: sonic-ecosystem, chain: "Sonic", tags: ["sonic"]}
+  berachain: {label: "Berachain", native: berachain-bera, symbol: BERA, category: berachain-ecosystem, chain: "Berachain", tags: ["berachain"]}
+  linea: {label: "Linea", native: null, symbol: null, category: linea-ecosystem, chain: "Linea", tags: ["linea"]}
+  hyperliquid: {label: "Hyperliquid", native: hyperliquid, symbol: HYPE, category: hyperliquid-ecosystem, chain: "Hyperliquid L1", tags: ["hyperliquid"]}
