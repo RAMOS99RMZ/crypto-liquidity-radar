@@ -43,7 +43,7 @@ log = logging.getLogger("radar")
 # ======================================================================
 # models.py
 # ======================================================================
-FEATURES = ["sector", "breadth", "gap", "corr", "vol", "attention", "stable", "whale", "dex", "momo", "context", "rotation"]
+FEATURES = ["sector", "breadth", "gap", "corr", "vol", "attention", "stable", "whale", "dex", "momo", "context", "rotation", "chain", "rs", "accum"]
 
 
 def to_float(x) -> Optional[float]:
@@ -136,7 +136,7 @@ class Candidate:
 # ======================================================================
 ENV_KEYS = [
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "COINGECKO_API_KEY", "COINGECKO_PLAN",
-    "ETHERSCAN_API_KEY", "SOLANA_RPC_URL", "ANTHROPIC_API_KEY",
+    "ETHERSCAN_API_KEY", "SOLANA_RPC_URL", "ANTHROPIC_API_KEY", "GH_TOKEN",
 ]
 ROOT = Path(__file__).resolve().parent
 _MISSING = object()
@@ -406,6 +406,16 @@ class CoinGecko:
                     ids.add(str(item["id"]))
         return ids
 
+    def global_stats(self) -> Optional[dict]:
+        d = self._get("/global")
+        g = d.get("data") if isinstance(d, dict) else None
+        if not isinstance(g, dict):
+            return None
+        mc = to_float((g.get("total_market_cap") or {}).get("usd"))
+        return {"mcap": mc, "btc_dom": to_float((g.get("market_cap_percentage") or {}).get("btc")),
+                "mcap_ch24": to_float(g.get("market_cap_change_percentage_24h_usd")),
+                "vol24": to_float((g.get("total_volume") or {}).get("usd"))} if mc else None
+
     def category_ids(self) -> list:
         data = self._get("/coins/categories/list")
         if not isinstance(data, list):
@@ -445,26 +455,29 @@ class DefiLlama:
         return out
 
     def protocols(self) -> dict:
-        """تغيّر TVL للبروتوكولات (مجاني بلا مفتاح). مفاتيح: gecko_id و"sym:الرمز"، مع الفئة والشبكات."""
+        """{map: {gecko_id | "sym:الرمز": معلومات}, rows: قائمة بروتوكولات} مجاناً وبلا مفتاح."""
         data = self.http.get_json("https://api.llama.fi/protocols")
         out: dict = {}
+        rows: list = []
         for p in data if isinstance(data, list) else []:
             if not isinstance(p, dict):
                 continue
             tvl = to_float(p.get("tvl"))
             if not tvl or tvl < 2e6:
                 continue
+            chains = [str(c) for c in (p.get("chains") or [])][:12]
+            sym = str(p.get("symbol") or "").upper()
+            sym = "" if sym in ("-", "") else sym
             info = {"tvl": tvl, "d1": to_float(p.get("change_1d")), "d7": to_float(p.get("change_7d")),
-                    "cat": str(p.get("category") or ""), "chains": [str(c) for c in (p.get("chains") or [])][:12]}
-            keys = []
-            if p.get("gecko_id"):
-                keys.append(str(p["gecko_id"]))
-            if p.get("symbol") and str(p["symbol"]) not in ("-", ""):
-                keys.append("sym:" + str(p["symbol"]).upper())
+                    "cat": str(p.get("category") or ""), "chains": chains}
+            keys = ([str(p["gecko_id"])] if p.get("gecko_id") else []) + (["sym:" + sym] if sym else [])
             for k in keys:
                 if k not in out or tvl > out[k]["tvl"]:
                     out[k] = info
-        return out
+            if tvl >= 3e6:
+                rows.append({"sym": sym, "cat": info["cat"], "chains": chains, "tvl": tvl, "d1": info["d1"], "d7": info["d7"]})
+        rows.sort(key=lambda r: -r["tvl"])
+        return {"map": out, "rows": rows[:1200]}
 
     def chains_tvl(self) -> dict:
         """{chain_norm: tvl_usd}"""
@@ -525,6 +538,7 @@ def summarize_pair(p) -> Optional[dict]:
             "fdv": to_float(p.get("fdv")) or 0.0,
             "url": p.get("url") or "",
             "pair": str(p.get("pairAddress") or "").lower(),
+            "created": to_float(p.get("pairCreatedAt")),
         }
     except (AttributeError, TypeError, ValueError):
         return None
@@ -1074,6 +1088,13 @@ class Paprika:
     def category_ids(self) -> list:
         return []
 
+    def global_stats(self) -> Optional[dict]:
+        d = self._get("/global")
+        if not isinstance(d, dict) or not to_float(d.get("market_cap_usd")):
+            return None
+        return {"mcap": to_float(d["market_cap_usd"]), "btc_dom": to_float(d.get("bitcoin_dominance_percentage")),
+                "mcap_ch24": to_float(d.get("market_cap_change_24h")), "vol24": to_float(d.get("volume_24h_usd"))}
+
 
 def _toks(s: str) -> set:
     out = set()
@@ -1422,8 +1443,8 @@ class Attention:
 # brain.py
 # ======================================================================
 PRIOR = {
-    "sector": 0.16, "breadth": 0.06, "gap": 0.14, "corr": 0.08, "vol": 0.11,
-    "attention": 0.08, "stable": 0.07, "whale": 0.13, "dex": 0.05, "momo": 0.03, "context": 0.03, "rotation": 0.06,
+    "sector": 0.13, "breadth": 0.05, "gap": 0.12, "corr": 0.07, "vol": 0.09, "attention": 0.07, "stable": 0.06,
+    "whale": 0.11, "dex": 0.04, "momo": 0.03, "context": 0.03, "rotation": 0.05, "chain": 0.06, "rs": 0.04, "accum": 0.05,
 }
 NEUTRAL = 0.3  # قيمة تعويضية لميزة غير متاحة داخل النموذج المتعلَّم
 
@@ -1527,8 +1548,10 @@ KIND_LABEL = {
     "bridge": "🌉 تدفق سيولة للشبكة",
     "waterfall": "🌊 شلال سيولة بيئي",
     "sector": "🔁 تدوير قطاعي",
+    "chainsector": "🏗 تدفق فئة داخل شبكة",
+    "rotation": "🔭 انتقال سيولة متوقع",
 }
-KIND_ORDER = ["whale", "bridge", "waterfall", "sector"]
+KIND_ORDER = ["whale", "bridge", "waterfall", "chainsector", "rotation", "sector"]
 NUM = ["①", "②", "③", "④", "⑤"]
 LINE = "━━━━━━━━━━━━━━━━━━"
 
@@ -1591,8 +1614,17 @@ def format_signal(cand, score: float, plan: dict, tz: str, extra: Optional[dict]
     L = [f"🟢 <b>إشارة شراء</b> · <b>#{e(c.symbol)}</b>  <i>{e(c.name)}</i>", LINE,
          f"🏷 <b>النوع:</b> {kinds}",
          f"🧭 <b>القطاع:</b> {e(' + '.join(cand.sectors[:2]) or '—')}",
-         f"🔥 <b>القوة:</b> {bar(score)} <b>{score:.0f}/100</b>  ·  الثقة: <b>{confidence_label(cand.features)}</b>",
-         "", "📌 <b>لماذا الآن؟</b>"]
+         f"🔥 <b>القوة:</b> {bar(score)} <b>{score:.0f}/100</b>  ·  الثقة: <b>{confidence_label(cand.features)}</b>"]
+    st = extra.get("state")
+    if st:
+        L.append(f"🧬 <b>الحالة:</b> {st} — {STATE_AR.get(st, '')}")
+    g = extra.get("glob") or {}
+    if g.get("score") is not None:
+        arrow = {"ENTERING": "تدخل ↑", "EXITING": "تخرج ↓", "NEUTRAL": "محايدة"}.get(g.get("state"), "")
+        L.append(f"🌍 <b>السيولة العالمية:</b> {g['score']:.0f}/100 ({arrow})")
+    if extra.get("path"):
+        L.append(f"🛤 <b>المسار:</b> {e(extra['path'])}")
+    L += ["", "📌 <b>لماذا الآن؟</b>"]
     L += [f"{NUM[i]} {e(r)}" for i, r in enumerate(reasons)]
     dex = cand.meta.get("dex") or {}
     xr = extra.get("xratio")
@@ -1604,6 +1636,16 @@ def format_signal(cand, score: float, plan: dict, tz: str, extra: Optional[dict]
         tx = dex["buys_h1"] + dex["sells_h1"]
         mk.append(f"• سيولة DEX: {fmt_usd(dex['liq'])}" + (f" · ضغط الشراء {dex['buys_h1'] / tx * 100:.0f}% (1س)" if tx else ""))
     L += ["", "📊 <b>السوق</b>"] + mk
+    ws = extra.get("whale_score")
+    if ws and (ws["usd"] > 0 or ws["wallets"]):
+        L.append(f"🐋 Whale Score: <b>{ws['score']:.0f}/100</b> ({ws['wallets']} محافظ · {fmt_usd(ws['usd'])})"
+                 + (f" · صافي ذكي 24س {fmt_usd(extra['sm24'])}" if extra.get("sm24") else ""))
+    q = extra.get("quality")
+    if q:
+        L.append(f"💧 جودة السيولة: <b>{q['score']:.0f}/100</b> — {e(' · '.join(q['notes'][:2]))}")
+    m = extra.get("manip")
+    if m and m["risk"] >= 20:
+        L.append(f"⚠️ خطر تلاعب: <b>{m['risk']}/100</b> — {e(' · '.join(m['notes'][:2]) or 'مؤشرات ضعيفة')}")
     L += ["", "🎯 <b>الأهداف</b>  <i>(مبنية على المقاومات والسيولة)</i>"]
     for t in plan["targets"]:
         L.append(f"T{t['k']}  <code>${fmt_price(t['price'])}</code>  <b>{t['pct']:+.1f}%</b>  ← {e(t['basis'])}")
@@ -1620,6 +1662,18 @@ def format_signal(cand, score: float, plan: dict, tz: str, extra: Optional[dict]
         L.append(" · ".join(walls))
     if plan["flow_usd"]:
         L.append(f"💧 تدفق شراء مقدّر: {fmt_usd(plan['flow_usd'])}" + ("" if plan["has_book"] else " (بدون دفتر أوامر)"))
+    at = extra.get("attrib")
+    if at and (at["pos"] or at["neg"]):
+        L += ["", "📐 <b>تفسير الدرجة</b>"]
+        if at["pos"]:
+            L.append("➕ " + " · ".join(f"{p:+.0f} {e(n)}" for n, p in at["pos"][:5]))
+        if at["neg"]:
+            L.append("➖ " + " · ".join(f"{p:+.0f} {e(n)}" for n, p in at["neg"][:4]))
+    pr, bt = extra.get("prob"), extra.get("bt")
+    if pr:
+        L.append(f"📈 احتمال النجاح (T1 قبل الوقف): <b>≈{pr['p'] * 100:.0f}%</b> (من {pr['n']} صفقة مماثلة لك)")
+    elif bt:
+        L.append(f"📈 محاكاة القاعدة تاريخياً: نجاح {bt['win_rate'] * 100:.0f}% ({bt['n']} حالة) — الاحتمال الفعلي يُعايَر بعد 20 صفقة")
     hist = extra.get("history") or []
     if hist:
         L += ["", "📚 <b>تاريخياً</b>"] + [f"• {e(h)}" for h in hist[:3]]
@@ -1628,11 +1682,23 @@ def format_signal(cand, score: float, plan: dict, tz: str, extra: Optional[dict]
         L += ["", "📰 <b>أخبار</b>"] + [f"• {e(n[:110])}" for n in news[:2]]
     if extra.get("llm"):
         L += ["", f"🤖 <b>المراجعة الذكية:</b> {e(extra['llm'])}"]
-    foot = f"⏱ {now_label(tz)}"
+    foot = ["", f"⏱ {now_label(tz)}"]
     link = safe_url(cand.meta.get("url"))
     if link:
-        foot += f" · <a href=\"{e(link, quote=True)}\">الرسم والسيولة</a>"
-    L += ["", foot, "<i>⚠️ تقديرات إحصائية وليست نصيحة مالية — التزم بالوقف وأدر حجم المخاطرة.</i>"]
+        foot[-1] += f" · <a href=\"{e(link, quote=True)}\">الرسم والسيولة</a>"
+    foot.append("<i>⚠️ تقديرات إحصائية وليست نصيحة مالية — التزم بالوقف وأدر حجم المخاطرة.</i>")
+    tail = "\n".join(foot)
+    return safe_join(L, 3900 - len(tail) - 2) + "\n" + tail
+
+
+def format_mint(d1: float, rows: list, glob: dict, tz: str) -> str:
+    L = ["💵 <b>ضخ سيولة دولارية جديد</b>", LINE, f"زاد المعروض من العملات المستقرة {fmt_usd(d1)} خلال 24 ساعة.",
+         "", "📍 <b>أين يُنشر هذا الدولار؟</b> (نصيب كل شبكة من الزيادة)"]
+    for r in rows[:5]:
+        L.append(f"• {html.escape(str(r['chain']))}: {fmt_usd(r['usd'])} ({r['share'] * 100:.0f}%)")
+    if glob.get("score") is not None:
+        L.append(f"\n🌍 السيولة العالمية: {glob['score']:.0f}/100")
+    L += ["", f"⏱ {now_label(tz)}", "<i>إشارة مبكرة: الشبكة التي تستقبل الدولار أولاً غالباً تتحرك أصولها لاحقاً. ليست توصية شراء.</i>"]
     return safe_join(L, 3900)
 
 
@@ -2171,11 +2237,11 @@ def rotation_annotate(stats: dict, sector_data: dict, state_data: dict, now: flo
         del sh[k]
 
 
-def rotation_forecast(stats: dict, know, cfg, now: float) -> list:
-    """يتوقع القطاعات التي ستصلها السيولة قبل أن تتحرك، من قطاعات في مرحلة اتساع/قيادة/تأخر.
+def rotation_forecast(stats: dict, know, cfg, now: float, native_hot: Optional[list] = None) -> list:
+    """يتوقع القطاعات التي ستصلها السيولة قبل أن تتحرك.
 
-    المصدر الأول: ترتيب الانتقال التاريخي المستخرج من الاختبار الرجعي (knowledge.json).
-    المصدر الثاني: ترتيب افتراضي عام من الإعدادات إن لم تتوفر معرفة تاريخية للقطاع.
+    القائد قد يكون قطاعاً ساخناً أو عملة أم (ETH/SOL...) اخترقت. العلاقات من محرك Lead-Lag التاريخي
+    (وقت التقدّم، نسبة الإصابة، الثقة) وإن غابت يُستخدم ترتيب افتراضي عام بثقة مخفّضة.
     """
     rc = cfg.get("rotation")
     if not rc["enabled"]:
@@ -2183,12 +2249,18 @@ def rotation_forecast(stats: dict, know, cfg, now: float) -> list:
     hot_heat = float(cfg.get("sector.hot_heat"))
     prior = {}
     for a, b in rc.get("prior_pairs") or []:
-        prior.setdefault(a, []).append({"to": b, "lag_h": rc["prior_lag_h"], "corr": rc["prior_corr"], "src": "prior"})
-    out: dict = {}
+        prior.setdefault(a, []).append({"to": b, "lag_h": rc["prior_lag_h"], "strength": clip(rc["prior_corr"] / 0.35),
+                                        "hit": None, "n": None, "excess": None, "src": "prior"})
+    sources = []
     for a, sa in stats.items():
-        if sa.get("stage") not in ("leaders", "broadening", "late", "running") or sa["heat"] < rc["min_source_heat"]:
-            continue
-        links = [dict(f, src="history") for f in know.followers(a)] or prior.get(a, [])
+        if sa.get("stage") in ("leaders", "broadening", "late", "running") and sa["heat"] >= rc["min_source_heat"]:
+            sources.append((a, sa, know.links(a) or prior.get(a, [])))
+    for nh in native_hot or []:
+        links = know.links("native:" + nh["sym"])
+        if links:
+            sources.append(("native:" + nh["sym"], {"heat": nh["ch24"], "stage": "running", "hot_since_h": None}, links))
+    out: dict = {}
+    for a, sa, links in sources:
         for lk in links:
             b = lk["to"]
             sb = stats.get(b)
@@ -2198,13 +2270,14 @@ def rotation_forecast(stats: dict, know, cfg, now: float) -> list:
             since = sa.get("hot_since_h")
             in_window = since is None or (rc["window_low"] * lag <= since <= rc["window_high"] * lag + 6.0)
             stage_w = {"leaders": 0.6, "broadening": 1.0, "late": 0.9, "running": 0.7}[sa["stage"]]
-            conf = clip(sa["heat"] / 10.0) * clip(lk["corr"] / 0.35) * stage_w * (1.0 if in_window else 0.55)
+            conf = clip(sa["heat"] / 10.0) * lk["strength"] * stage_w * (1.0 if in_window else 0.55)
             if lk["src"] == "prior":
                 conf *= 0.6  # افتراض عام أضعف من معرفة تاريخية
             cur = out.get(b)
             if cur is None or conf > cur["conf"]:
-                out[b] = {"to": b, "from": a, "lag_h": lag, "corr": lk["corr"], "src": lk["src"], "conf": conf,
-                          "stage": sa["stage"], "from_heat": sa["heat"], "since_h": since, "in_window": in_window}
+                out[b] = {"to": b, "from": a, "lag_h": lag, "corr": round(lk["strength"] * 0.35, 3), "src": lk["src"],
+                          "conf": conf, "stage": sa["stage"], "from_heat": sa["heat"], "since_h": since,
+                          "in_window": in_window, "hit": lk.get("hit"), "n": lk.get("n"), "excess": lk.get("excess")}
     rows = sorted(out.values(), key=lambda r: -r["conf"])
     return [r for r in rows if r["conf"] >= rc["min_conf"]]
 
@@ -2235,6 +2308,8 @@ def format_rotation(fc: dict, label_from: str, label_to: str, picks: list, tz: s
          f"إلى: <b>{e(label_to)}</b>  (ما زال هادئاً)",
          f"⏳ النافذة المتوقعة: بعد ~{lo:.0f}–{hi:.0f} ساعة  ·  الثقة: <b>{fc['conf'] * 100:.0f}%</b>",
          f"📚 المصدر: {src} (ارتباط {fc['corr']:.2f})"]
+    if fc.get("hit") is not None:
+        L.append(f"🎯 نسبة الإصابة التاريخية: {fc['hit'] * 100:.0f}% ({fc['n']} حالة) · متوسط الصعود الزائد +{fc['excess']:.1f}%")
     if fc.get("since_h") is not None:
         L.append(f"🕒 القطاع المصدر ساخن منذ ~{fc['since_h']:.0f} ساعة" + ("" if fc["in_window"] else " (خارج النافذة المعتادة)"))
     if picks:
@@ -2243,6 +2318,359 @@ def format_rotation(fc: dict, label_from: str, label_to: str, picks: list, tz: s
             L.append(f"• <b>#{e(c.symbol)}</b>  1س {fmt_pct(c.ch1h)} · 24س {fmt_pct(c.ch24h)}" + (f" · حجم ×{r:.1f}" if r else ""))
     L += ["", f"⏱ {now_label(tz)}", "<i>توقّع احتمالي مبني على أنماط تاريخية، وليس إشارة شراء. انتظر تأكيد الحجم والسيولة.</i>"]
     return safe_join(L, 3900)
+
+
+# ======================================================================
+# engines
+# ======================================================================
+STATES = ["DORMANT", "SEEDING", "IGNITION", "MARKUP", "DISTRIBUTION"]
+STATE_AR = {"DORMANT": "خامل", "SEEDING": "زرع السيولة (تجميع)", "IGNITION": "اشتعال", "MARKUP": "صعود مكتمل",
+            "DISTRIBUTION": "تصريف"}
+FEATURE_AR = {"sector": "سخونة القطاع", "breadth": "اتساع الصعود", "gap": "فجوة اللحاق", "corr": "الارتباط",
+              "vol": "حجم التداول", "attention": "زخم الانتباه", "stable": "تدفق المستقرات", "whale": "الحيتان",
+              "dex": "ضغط DEX", "momo": "الزخم اللحظي", "context": "TVL/أخبار", "rotation": "انتقال السيولة",
+              "chain": "قوة الشبكة", "rs": "القوة النسبية", "accum": "التجميع الصامت"}
+
+
+class Macro:
+    """بيانات مجانية بلا مفتاح: المستقرات، حجم DEX، الرسوم والإيرادات، التمويل والفائدة المفتوحة، نشاط المطورين."""
+
+    LLAMA = "https://api.llama.fi"
+    STABLE = "https://stablecoins.llama.fi"
+    HL = "https://api.hyperliquid.xyz/info"
+
+    def __init__(self, http, gh_token: Optional[str] = None):
+        self.http = http
+        self.gh = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json"} if gh_token else {}
+
+    def stable_summary(self) -> Optional[dict]:
+        d = self.http.get_json(self.STABLE + "/stablecoins", params={"includePrices": "false"})
+        assets = d.get("peggedAssets") if isinstance(d, dict) else None
+        if not isinstance(assets, list):
+            return None
+        tot = {"now": 0.0, "d1": 0.0, "d7": 0.0, "d30": 0.0}
+        for a in assets:
+            if not isinstance(a, dict) or a.get("pegType") != "peggedUSD":
+                continue
+            for k, f in (("now", "circulating"), ("d1", "circulatingPrevDay"), ("d7", "circulatingPrevWeek"),
+                         ("d30", "circulatingPrevMonth")):
+                v = a.get(f)
+                tot[k] += (to_float(v.get("peggedUSD")) or 0.0) if isinstance(v, dict) else 0.0
+        return tot if tot["now"] > 0 and tot["d7"] > 0 else None
+
+    def stable_chart(self, chain: str) -> Optional[dict]:
+        d = self.http.get_json(f"{self.STABLE}/stablecoincharts/{chain}")
+        if not isinstance(d, list) or len(d) < 9:
+            return None
+        pts = []
+        for r in d[-40:]:
+            try:
+                v = to_float((r.get("totalCirculatingUSD") or {}).get("peggedUSD"))
+                if v:
+                    pts.append((int(float(r["date"])), v))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+        if len(pts) < 9:
+            return None
+        now_v, d1, d7 = pts[-1][1], pts[-2][1], pts[-8][1]
+        return {"now": now_v, "d1_usd": now_v - d1, "d1_pct": (now_v / d1 - 1) * 100.0,
+                "d7_usd": now_v - d7, "d7_pct": (now_v / d7 - 1) * 100.0}
+
+    def _overview(self, kind: str, chain: Optional[str], revenue: bool = False) -> Optional[dict]:
+        path = f"/overview/{kind}" + (f"/{chain}" if chain else "")
+        params = {"excludeTotalDataChart": "true", "excludeTotalDataChartBreakdown": "true"}
+        if revenue:
+            params["dataType"] = "dailyRevenue"
+        d = self.http.get_json(self.LLAMA + path, params=params)
+        if not isinstance(d, dict) or to_float(d.get("total24h")) is None:
+            return None
+        prots = []
+        for p in d.get("protocols") or []:
+            if isinstance(p, dict) and to_float(p.get("total24h")):
+                prots.append({"cat": str(p.get("category") or ""), "t24": to_float(p.get("total24h")) or 0.0,
+                              "c7": to_float(p.get("change_7d"))})
+        return {"t24": to_float(d.get("total24h")) or 0.0, "c1": to_float(d.get("change_1d")),
+                "c7": to_float(d.get("change_7d")), "prots": prots[:300]}
+
+    def dex(self, chain=None):
+        return self._overview("dexs", chain)
+
+    def fees(self, chain=None):
+        return self._overview("fees", chain)
+
+    def revenue(self, chain=None):
+        return self._overview("fees", chain, revenue=True)
+
+    def derivs(self) -> dict:
+        """{الرمز: {funding (سنوي %), oi_usd, mark}} من Hyperliquid (بلا مفتاح)."""
+        d = self.http.post_json(self.HL, {"type": "metaAndAssetCtxs"})
+        out: dict = {}
+        try:
+            uni, ctxs = d[0]["universe"], d[1]
+            for u, c in zip(uni, ctxs):
+                mark, oi, fr = to_float(c.get("markPx")), to_float(c.get("openInterest")), to_float(c.get("funding"))
+                if mark and oi is not None and fr is not None:
+                    out[str(u["name"]).upper()] = {"funding": fr * 24 * 365 * 100.0, "oi_usd": oi * mark, "mark": mark}
+        except (TypeError, KeyError, IndexError, AttributeError):
+            return {}
+        return out
+
+    def commits(self, repo: str) -> Optional[dict]:
+        d = self.http.get_json(f"https://api.github.com/repos/{repo}/stats/commit_activity", headers=self.gh or None)
+        if not isinstance(d, list) or len(d) < 8:
+            return None
+        w = [int(x.get("total", 0)) for x in d if isinstance(x, dict)]
+        last, prev = sum(w[-4:]), sum(w[-8:-4])
+        return {"last4": last, "prev4": prev, "growth": (last / prev - 1.0) if prev else (1.0 if last else 0.0)}
+
+
+def _wavg(parts: list):
+    """متوسط موزون يتجاهل المكوّنات غير المتاحة. يعيد (النتيجة 0-100 أو None، وزن المتاح)."""
+    num = den = 0.0
+    for w, v, _ in parts:
+        if v is not None:
+            num += w * clip(v)
+            den += w
+    return (100.0 * num / den if den > 0 else None), den
+
+
+def global_liquidity(inp: dict, hist: list, now: float) -> dict:
+    """GLOBAL LIQUIDITY SCORE (0-100): هل السيولة تدخل سوق الكريبتو أم تخرج منه؟"""
+    parts, notes = [], []
+    ss = inp.get("stable")
+    if ss:
+        g7, g1 = (ss["now"] / ss["d7"] - 1) * 100.0, (ss["now"] / ss["d1"] - 1) * 100.0 if ss.get("d1") else 0.0
+        parts += [(0.25, (g7 + 0.2) / 1.0, f"المعروض المستقر {g7:+.2f}% (7 أيام)"),
+                  (0.08, (g1 + 0.05) / 0.25, f"المستقرات {g1:+.2f}% (24س)")]
+    g = inp.get("glob") or {}
+    old = None
+    for h in hist:
+        if abs((now - h["ts"]) - 7 * 86400) < 14 * 3600 and (old is None or abs(now - h["ts"] - 7 * 86400) < abs(now - old["ts"] - 7 * 86400)):
+            old = h
+    if g.get("mcap"):
+        ch7 = (g["mcap"] / old["mcap"] - 1) * 100.0 if old and old.get("mcap") else None
+        ch24 = g.get("mcap_ch24")
+        v = [x for x in ((ch7 + 5) / 15 * 0.6 if ch7 is not None else None, (ch24 + 2) / 6 * 0.4 if ch24 is not None else None) if x is not None]
+        if v:
+            parts.append((0.20, sum(v) / (0.6 * (ch7 is not None) + 0.4 * (ch24 is not None)),
+                          f"القيمة السوقية الكلية {ch24 or 0:+.1f}% (24س)" + (f" · {ch7:+.1f}% (7أ)" if ch7 is not None else "")))
+        if g.get("btc_dom") is not None and old and old.get("dom") is not None:
+            dd = g["btc_dom"] - old["dom"]
+            parts.append((0.12, 0.5 - dd / 4.0, f"هيمنة BTC {g['btc_dom']:.1f}% ({dd:+.1f} نقطة/7أ)" + (" — صديقة للألتات" if dd < 0 else " — ضاغطة على الألتات")))
+    dx = inp.get("dex")
+    if dx and dx.get("c7") is not None:
+        parts.append((0.15, (dx["c7"] + 10) / 40.0, f"حجم DEX {dx['c7']:+.0f}% (7أ)"))
+    de = inp.get("derivs") or {}
+    fl = [de[k]["funding"] for k in ("BTC", "ETH") if k in de]
+    if fl:
+        f = sum(fl) / len(fl)
+        v = f / 10.0 if f <= 30 else 1.0 - (f - 30.0) / 60.0
+        parts.append((0.10, v if f > -20 else 0.0, f"التمويل السنوي BTC/ETH {f:+.0f}%" + (" (محموم)" if f > 60 else "")))
+    oi = sum(x["oi_usd"] for x in de.values()) if de else 0.0
+    if oi and old and old.get("oi"):
+        c = (oi / old["oi"] - 1) * 100.0
+        parts.append((0.10, (c + 10) / 30.0, f"الفائدة المفتوحة {c:+.0f}% (7أ)" + (" — رافعة مرتفعة" if c > 25 else "")))
+    score, den = _wavg(parts)
+    if score is None or den < 0.3:
+        return {"score": None, "state": "UNKNOWN", "notes": [], "oi": oi}
+    state = "ENTERING" if score >= 62 else ("EXITING" if score <= 42 else "NEUTRAL")
+    return {"score": score, "state": state, "notes": [t for _, v, t in parts if v is not None], "oi": oi,
+            "coverage": den}
+
+
+def chain_flow_score(d: dict) -> dict:
+    """CHAIN FLOW SCORE (0-100) لكل شبكة من: المستقرات، TVL، حجم DEX، الرسوم، الإيرادات، المطورين، الجسور."""
+    st = d.get("stable") or {}
+    parts = [
+        (0.22, ((st["d7_pct"] + 0.5) / 4.0) if st.get("d7_pct") is not None else None, f"مستقرات {st.get('d7_pct', 0):+.1f}% (7أ)"),
+        (0.08, ((st["d1_pct"] + 0.1) / 0.8) if st.get("d1_pct") is not None else None, f"مستقرات {st.get('d1_pct', 0):+.2f}% (24س)"),
+        (0.18, ((d["tvl_d7"] + 3) / 20.0) if d.get("tvl_d7") is not None else None, f"TVL {d.get('tvl_d7') or 0:+.1f}% (7أ)"),
+        (0.15, ((d["dex_c7"] + 10) / 50.0) if d.get("dex_c7") is not None else None, f"حجم DEX {d.get('dex_c7') or 0:+.0f}%"),
+        (0.10, ((d["fees_c7"] + 10) / 50.0) if d.get("fees_c7") is not None else None, f"رسوم {d.get('fees_c7') or 0:+.0f}%"),
+        (0.07, ((d["rev_c7"] + 10) / 50.0) if d.get("rev_c7") is not None else None, f"إيرادات {d.get('rev_c7') or 0:+.0f}%"),
+        (0.05, ((d["dev_growth"] + 0.2) / 0.6) if d.get("dev_growth") is not None else None, f"مطورون {(d.get('dev_growth') or 0) * 100:+.0f}%"),
+        (0.15, d.get("bridge"), "تدفق جسور/مستقرات لحظي"),
+    ]
+    score, den = _wavg(parts)
+    return {"score": score, "coverage": den, "notes": [t for _, v, t in parts if v is not None]}
+
+
+def stable_deployment(chart_by_chain: dict, total_d1_usd: Optional[float]) -> list:
+    """أين يُنشر الدولار الجديد؟ نصيب كل شبكة من الزيادة اليومية الموجبة، مرتّباً."""
+    pos = {k: v["d1_usd"] for k, v in chart_by_chain.items() if v and v.get("d1_usd") and v["d1_usd"] > 0}
+    tot = sum(pos.values())
+    if tot <= 0:
+        return []
+    rows = [{"chain": k, "usd": v, "share": v / tot} for k, v in pos.items()]
+    rows.sort(key=lambda r: -r["usd"])
+    for r in rows:
+        r["of_global"] = (r["usd"] / total_d1_usd) if total_d1_usd and total_d1_usd > 0 else None
+    return rows
+
+
+def chain_sector_matrix(rows: list, fees_by_chain: dict) -> list:
+    """SECTOR FLOW SCORE لكل (شبكة، فئة) من نمو TVL والرسوم لبروتوكولات الشبكة الواحدة."""
+    groups: dict = {}
+    for r in rows:
+        if len(r["chains"]) != 1 or r["tvl"] < 3e6 or r["d7"] is None:
+            continue
+        g = groups.setdefault((r["chains"][0], r["cat"]), {"tvl": 0.0, "wg": 0.0, "n": 0, "syms": []})
+        g["tvl"] += r["tvl"]
+        g["wg"] += r["tvl"] * max(-50.0, min(200.0, r["d7"]))
+        g["n"] += 1
+        if r["sym"]:
+            g["syms"].append((r["sym"], r["tvl"], r["d7"]))
+    out = []
+    for (chain, cat), g in groups.items():
+        if g["n"] < 2 or not cat:
+            continue
+        g7 = g["wg"] / g["tvl"]
+        fv, ft = None, ""
+        fe = (fees_by_chain.get(norm_chain(chain)) or {}).get("prots") or []
+        cp = [p for p in fe if p["cat"] == cat and p["c7"] is not None]
+        if cp:
+            tw = sum(p["t24"] for p in cp)
+            fg = sum(p["t24"] * max(-80.0, min(300.0, p["c7"])) for p in cp) / tw if tw else None
+            if fg is not None:
+                fv, ft = (fg + 10) / 50.0, f"رسوم الفئة {fg:+.0f}%"
+        score, _ = _wavg([(0.6, (g7 + 2) / 18.0, f"TVL {g7:+.1f}%"), (0.4, fv, ft)])
+        out.append({"chain": chain, "cat": cat, "score": score, "g7": g7, "tvl": g["tvl"], "n": g["n"],
+                    "fees_note": ft, "syms": sorted(g["syms"], key=lambda x: -x[1])[:8]})
+    out.sort(key=lambda r: -r["score"])
+    return out
+
+
+def absorption_score(vol_ratio: Optional[float], ch1h: Optional[float], ch24h: Optional[float]) -> float:
+    """امتصاص السيولة: حجم يتضخم بينما السعر لا يتحرك = تجميع صامت (احتمال انفجار لاحق)."""
+    if vol_ratio is None or ch24h is None:
+        return 0.0
+    flat = clip(1.0 - abs(ch24h) / 6.0) * (1.0 if abs(ch1h or 0.0) < 1.5 else 0.5)
+    return clip((vol_ratio - 1.0) / 1.5) * flat
+
+
+def classify_state(ch24: float, ch1h: Optional[float], vol_ratio: Optional[float], whale_usd: float,
+                   chain_score: Optional[float], dex: Optional[dict], whale_inflow: bool = False) -> str:
+    """آلة الحالات: DORMANT → SEEDING → IGNITION → MARKUP → DISTRIBUTION."""
+    r = vol_ratio if vol_ratio is not None else 1.0
+    sells_dominate = False
+    if dex:
+        tx = dex["buys_h1"] + dex["sells_h1"]
+        sells_dominate = tx >= 20 and dex["sells_h1"] > 1.25 * dex["buys_h1"]
+    if ch24 >= 6 and (sells_dominate or whale_inflow or (ch1h is not None and ch1h <= -1.5 and r >= 1.8)):
+        return "DISTRIBUTION"
+    if ch24 >= 10 or (ch24 >= 6 and r >= 1.5):
+        return "MARKUP"
+    if r >= 1.5 and 1.5 <= ch24 < 6 and (ch1h or 0.0) > 0.4:
+        return "IGNITION"
+    if (r >= 1.3 or whale_usd > 0 or (chain_score or 0) >= 60) and ch24 < 3 and abs(ch1h or 0.0) < 1.5:
+        return "SEEDING"
+    return "DORMANT"
+
+
+def relative_strength(ch24: Optional[float], ch7d: Optional[float], btc24: Optional[float], btc7d: Optional[float],
+                      sector_med: Optional[float]) -> Optional[float]:
+    parts = []
+    if ch24 is not None and btc24 is not None:
+        parts.append(clip((ch24 - btc24) / 8.0 + 0.5))
+    if ch7d is not None and btc7d is not None:
+        parts.append(clip((ch7d - btc7d) / 25.0 + 0.5))
+    if ch24 is not None and sector_med is not None:
+        parts.append(clip((ch24 - sector_med) / 10.0 + 0.5))
+    return sum(parts) / len(parts) if parts else None
+
+
+def liquidity_quality(book: Optional[dict], dex: Optional[dict], pools: int, mcap: float) -> Optional[dict]:
+    """جودة السيولة 0-100: فارق السعر، عمق ±2%، عدد المجمعات، سيولة DEX نسبة للقيمة السوقية."""
+    parts, notes = [], []
+    if book and book.get("asks") and book.get("bids"):
+        a0, b0 = book["asks"][0][0], book["bids"][0][0]
+        spread = (a0 / b0 - 1.0) * 100.0
+        mid = (a0 + b0) / 2.0
+        depth = sum(p * q for p, q in book["asks"] if p <= mid * 1.02) + sum(p * q for p, q in book["bids"] if p >= mid * 0.98)
+        parts += [(0.25, 1.0 - spread / 0.6, f"فارق {spread:.2f}%"), (0.35, depth / 150000.0, f"عمق ±2% ≈ {fmt_usd(depth)}")]
+    if dex:
+        parts.append((0.15, pools / 4.0, f"{pools} مجمع/مجمعات"))
+        if mcap > 0:
+            parts.append((0.15, dex["liq"] / (0.02 * mcap), f"سيولة DEX {fmt_usd(dex['liq'])}"))
+    score, den = _wavg(parts)
+    if score is None or den < 0.3:
+        return None
+    return {"score": score, "notes": [t for _, v, t in parts if v is not None]}
+
+
+def manipulation_risk(coin, dex: Optional[dict], now: float) -> dict:
+    """كاشف التلاعب (0-100): حجم وهمي، عملة حديثة قليلة السيولة، تضخم FDV، أنماط بوتات."""
+    pts, notes = 0, []
+    base = coin.xvol or coin.volume
+    turnover = base / coin.mcap if coin.mcap > 0 else 0.0
+    if turnover > 1.0:
+        pts, notes = pts + 30, notes + [f"حجم/قيمة سوقية {turnover * 100:.0f}%"]
+    elif turnover > 0.5:
+        pts += 12
+    if dex:
+        if dex["liq"] > 0 and dex["vol_h24"] / dex["liq"] > 30:
+            pts, notes = pts + 25, notes + ["حجم DEX يفوق السيولة 30 ضعفاً"]
+        created = dex.get("created")
+        if created and now - created / 1000.0 < 72 * 3600:
+            pts, notes = pts + 25, notes + ["زوج تداول حديث (<72 ساعة)"]
+        if dex["mcap"] > 0 and dex["fdv"] / dex["mcap"] > 5:
+            pts, notes = pts + 15, notes + ["FDV يفوق القيمة المتداولة 5 أضعاف (تضخم مؤجل)"]
+        tx = dex["buys_h1"] + dex["sells_h1"]
+        if tx >= 50 and (dex["buys_h1"] / tx > 0.92 or dex["buys_h1"] / tx < 0.08):
+            pts, notes = pts + 10, notes + ["نمط شراء/بيع أحادي الاتجاه (بوتات؟)"]
+        if coin.mcap and coin.mcap < 1e7 and (coin.ch24h or 0) > 8 and dex["liq"] < 150000:
+            pts, notes = pts + 20, notes + ["صعود حاد بسيولة ضعيفة"]
+    return {"risk": min(100, pts), "notes": notes}
+
+
+def whale_score(events: list, net_flow_usd: float, min_usd: float) -> dict:
+    """WHALE SCORE (0-100): عدد المحافظ المجمّعة، قيمتها الموزونة، السحب من المنصات، غياب الإيداع."""
+    acc = [e for e in events if e["kind"] in ("accumulation", "exchange_outflow")]
+    inflow = [e for e in events if e["kind"] == "exchange_inflow" and e["usd"] >= min_usd]
+    wallets = {e["wallet"] for e in acc}
+    usd = sum(e["usd"] * e.get("weight", 1.0) for e in acc) + max(net_flow_usd, 0.0)
+    parts = [(0.35, len(wallets) / 3.0, ""), (0.35, usd / 500000.0, ""),
+             (0.15, 1.0 if any(e["kind"] == "exchange_outflow" for e in acc) or net_flow_usd >= min_usd else 0.0, ""),
+             (0.15, 0.0 if inflow else 1.0, "")]
+    score, _ = _wavg(parts)
+    return {"score": score or 0.0, "wallets": len(wallets), "usd": usd, "inflow": bool(inflow)}
+
+
+def narrative_velocity(st: dict, hist: list, news_now: int, news_prev: int, tvl_g7: Optional[float]) -> Optional[float]:
+    """سرعة السردية (0-100): تسارع الانتباه، اتساع الصعود، الأخبار، ونمو TVL معاً."""
+    parts = []
+    ar = st.get("att_ratio")
+    parts.append((0.3, (ar - 1.0) / 2.0 if ar is not None else None, ""))
+    b6 = next((h for h in reversed(hist) if st.get("_now", 0) - h[0] >= 5 * 3600), None) if hist else None
+    parts.append((0.25, ((st["breadth"] - b6[2]) / 0.3 + 0.5) if b6 else None, ""))
+    parts.append((0.2, (news_now - news_prev + 2) / 6.0 if (news_now or news_prev) else None, ""))
+    parts.append((0.25, (tvl_g7 + 2) / 18.0 if tvl_g7 is not None else None, ""))
+    s, den = _wavg(parts)
+    return s if den >= 0.4 else None
+
+
+def contributions(prior_w: dict, f: dict) -> list:
+    """مساهمة كل ميزة بالنقاط (نفس معادلة الدرجة الأولية) لشرح سبب الدرجة."""
+    avail = sum(w for k, w in prior_w.items() if f.get(k) is not None)
+    miss = sum(w for k, w in prior_w.items() if f.get(k) is None)
+    den = avail + 0.5 * miss
+    if den <= 0:
+        return []
+    rows = [(k, 100.0 * w * clip(f[k]) / den) for k, w in prior_w.items() if f.get(k) is not None]
+    return sorted(rows, key=lambda x: -x[1])
+
+
+def calibrated_probability(closed: list, score: float) -> Optional[dict]:
+    """احتمال النجاح (T1 قبل الوقف) من صفقاتنا المغلقة ذات الدرجات المماثلة (تصحيح لابلاس). None قبل 20 صفقة."""
+    rows = [(c["score"], c["y"]) for c in closed if c.get("score") is not None and c.get("y") in (0, 1)]
+    if len(rows) < 20:
+        return None
+    near = [y for s, y in rows if abs(s - score) <= 8.0]
+    if len(near) < 8:
+        near = [y for s, y in rows if abs(s - score) <= 15.0]
+    if len(near) < 8:
+        near = [y for _, y in rows]
+    return {"p": (sum(near) + 1.0) / (len(near) + 2.0), "n": len(near)}
 
 
 # ======================================================================
@@ -2274,6 +2702,15 @@ class Knowledge:
 
     def followers(self, sector_key: str) -> list:
         return (self.d.get("sector_flow") or {}).get(sector_key) or []
+
+    def links(self, leader: str) -> list:
+        """قائمة موحّدة بما يتبع القائد (قطاع بمفتاحه، أو عملة أم "native:SOL"): lag_h، strength 0-1، hit، n، excess."""
+        ll = (self.d.get("lead_lag") or {}).get(leader if leader.startswith("native:") else f"sector:{leader}")
+        if ll:
+            return [{"to": e["to"].split(":", 1)[1], "lag_h": e["lag_h"], "strength": e["conf"], "hit": e.get("hit"),
+                     "n": e.get("n"), "excess": e.get("excess_pct"), "src": "history"} for e in ll]
+        return [{"to": f["to"], "lag_h": f["lag_h"], "strength": clip(f["corr"] / 0.35), "hit": None, "n": None,
+                 "excess": None, "src": "history"} for f in self.followers(leader)] if not leader.startswith("native:") else []
 
     def eco(self, key: str) -> Optional[dict]:
         return (self.d.get("eco_response") or {}).get(key)
@@ -2476,6 +2913,46 @@ def run_backtest(cfg, cg, ex, say=print) -> dict:
                 rows.append({"to": b.split(":", 1)[1], "lag_h": bk, "corr": round(bc, 3)})
         rows.sort(key=lambda r: -r["corr"])
         sector_flow[a.split(":", 1)[1]] = rows[:3]
+    # محرك Lead-Lag: دراسة أحداث؛ من يقود ومن يتبع، بعد كم ساعة، بأي نسبة إصابة
+    lead_lag: dict = {}
+    nodes: dict = {k: np.nan_to_num(v) for k, v in baskets.items() if k.startswith("sector:")}
+    for sym in set(natives.values()) | {"BTC"}:
+        if sym in sidx:
+            nodes[f"native:{sym}"] = np.nan_to_num(R[sidx[sym]])
+    HZ = 72
+    thr_n = math.log1p(float(cfg.get("waterfall.native_24h")) / 100.0)
+    thr_s = math.log1p(float(cfg.get("sector.hot_heat")) / 100.0)
+    cums = {k: np.concatenate([[0.0], np.cumsum(v)]) for k, v in nodes.items()}
+    hs = np.arange(1, HZ + 1)
+    for lk, lv in nodes.items():
+        r24 = np.convolve(lv, np.ones(24), mode="full")[: len(lv)]
+        thr = thr_n if lk.startswith("native:") else thr_s
+        ev, last = [], -999
+        for t in range(24, len(lv) - HZ - 2):
+            if r24[t] >= thr and t - last >= 24:
+                ev.append(t)
+                last = t
+        if len(ev) < 4:
+            continue
+        ev = np.array(ev)
+        allt = np.arange(24, len(lv) - HZ - 2, 6)
+        edges = []
+        for fk, cf in cums.items():
+            if not fk.startswith("sector:") or fk == lk:
+                continue
+            curves = cf[ev[:, None] + 1 + hs[None, :]] - cf[ev + 1][:, None]
+            base = (cf[allt[:, None] + 1 + hs[None, :]] - cf[allt + 1][:, None]).mean(axis=0)
+            excess = curves.mean(axis=0) - base
+            hb = int(np.argmax(excess[1:])) + 2
+            ex = float(excess[hb - 1])
+            hit = float(np.mean(curves[:, hb - 1] > base[hb - 1]))
+            if hit >= 0.6 and ex * 100.0 >= 0.8:
+                conf = clip(len(ev) / 12.0) * clip((hit - 0.5) / 0.3) * clip(ex * 100.0 / 3.0)
+                edges.append({"to": fk, "lag_h": hb, "hit": round(hit, 2), "excess_pct": round(ex * 100.0, 2),
+                              "n": int(len(ev)), "conf": round(conf, 3)})
+        edges.sort(key=lambda e: -e["conf"])
+        if edges:
+            lead_lag[lk] = edges[:4]
     # استجابة الأنظمة البيئية لاختراق العملة الأم
     eco_resp: dict = {}
     thr = float(cfg.get("waterfall.native_24h"))
@@ -2538,7 +3015,7 @@ def run_backtest(cfg, cg, ex, say=print) -> dict:
                                "expectancy_R": round(float(np.mean([x["R"] for x in v])), 3)}
                            for k, v in by_sector.items() if len(v) >= 5}
     know = {"version": 2, "generated": int(time.time()), "interval": "1h", "hours": int(T), "coins": len(syms),
-            "relations": relations, "sector_flow": sector_flow, "eco_response": eco_resp, "backtest": result}
+            "relations": relations, "sector_flow": sector_flow, "lead_lag": lead_lag, "eco_response": eco_resp, "backtest": result}
     return know
 
 
@@ -2591,8 +3068,9 @@ class Budget:
         if b.get("month") != month:
             b["month"], b["used"] = month, 0
 
-    def take(self, n: float = 1.0) -> bool:
-        if self.b["tokens"] >= n:
+    def take(self, n: float = 1.0, force: bool = False) -> bool:
+        """force=True للطلبات الأساسية الرخيصة (لقطة السوق، السيولة العالمية): تُنفَّذ حتى لو نفد الرصيد مؤقتاً."""
+        if self.b["tokens"] >= n or force:
             self.b["tokens"] -= n
             self.b["used"] += int(n)
             return True
@@ -2621,7 +3099,7 @@ def estimate_cg_usage(cfg, live_ok: bool) -> dict:
 class Services:
     """حاوية المزوّدين (تسهّل الاختبار بمزوّدين وهميين)."""
 
-    NAMES = ("cg", "llama", "dex", "ex", "xfer", "sol", "news", "judge", "notifier", "know", "eth")
+    NAMES = ("cg", "llama", "dex", "ex", "xfer", "sol", "news", "judge", "notifier", "know", "eth", "macro")
 
     def __init__(self, **kw):
         for k in self.NAMES:
@@ -2698,6 +3176,13 @@ class Engine:
         self.members: dict = {}
         self.byid: dict = {}
         self.protocols: dict = {}
+        self.proto_rows: list = []
+        self.glob: dict = {}
+        self.chain_scores: dict = {}
+        self.chainflow: dict = {}
+        self.deploy: list = []
+        self.derivs: dict = {}
+        self.chsec: list = []
         self.news_items: list = []
         self.stats: dict = {}
 
@@ -2860,11 +3345,12 @@ class Engine:
     def _protocols(self, now: float) -> dict:
         p = self.state.data["protocols"]
         if now - p.get("ts", 0) >= 7200 and self._cg_ok("protocols", now):
-            m = self.s.llama.protocols()
-            if m:
-                p["ts"], p["map"] = now, m
+            m = self.s.llama.protocols() or {}
+            if m.get("map") or m.get("rows"):
+                p["ts"], p["map"], p["rows"] = now, m.get("map", {}), m.get("rows", [])
             else:
                 self._cg_fail("protocols", now)
+        self.proto_rows = p.get("rows") or []
         return p.get("map") or {}
 
     def _news(self, now: float) -> list:
@@ -2892,7 +3378,7 @@ class Engine:
         """كل العملات بطلب واحد؛ عند الفشل نستخدم آخر لقطة محفوظة (≤ ساعتين)."""
         sn = self.state.data.setdefault("snap", {"ts": 0, "rows": []})
         coins: list = []
-        if self._cg_ok("snapshot", now) and self.budget.take():
+        if self._cg_ok("snapshot", now) and self.budget.take(force=True):
             coins = self.s.cg.snapshot()
             if coins:
                 top = sorted(coins, key=lambda c: -c.mcap)[:1500]
@@ -3032,7 +3518,14 @@ class Engine:
         rc = self.cfg.get("rotation")
         warned = self.state.data["warned"]
         cands, sent = [], 0
-        for fc in rotation_forecast(stats, self.K, self.cfg, now):
+        nh = []
+        thr = float(self.cfg.get("waterfall.native_24h"))
+        for sym in {"BTC", "ETH"} | {str(e.get("symbol")).upper() for e in self.cfg.ecosystems.values() if e.get("symbol")}:
+            tk = self.tickers.get(sym) if self.tickers else None
+            if tk and tk.get("ch24") is not None and tk["ch24"] >= thr:
+                nh.append({"sym": sym, "ch24": tk["ch24"]})
+        for fc in rotation_forecast(stats, self.K, self.cfg, now, native_hot=nh):
+            lab_from = stats[fc["from"]]["label"] if fc["from"] in stats else fc["from"].replace("native:", "") + " (عملة أم)"
             b = fc["to"]
             picks = rotation_early(sector_data.get(b, []), stats[b], self.vr, self.cfg, int(rc["max_coins"]))
             if not picks:
@@ -3044,7 +3537,7 @@ class Engine:
                 cand.features = {"sector": clip(fc["conf"]), "breadth": clip(stats[b]["breadth"]), "gap": 0.25,
                                  "corr": clip(fc["corr"] / 0.5), "momo": clip(max(coin.ch1h or 0.0, 0.0) / 3.0),
                                  "rotation": clip(fc["conf"] * (0.6 + 0.4 * score))}
-                cand.reasons = [(1, f"🔭 توقّع انتقال سيولة من {stats[fc['from']]['label'].split('·')[0].strip()} "
+                cand.reasons = [(1, f"🔭 توقّع انتقال سيولة من {lab_from.split('·')[0].strip()} "
                                     f"إلى {stats[b]['label'].split('·')[0].strip()} (ثقة {fc['conf'] * 100:.0f}%)")]
                 cand.meta = {"att_ratio": stats[b].get("att_ratio"), "sector_key": b, "heat": stats[b]["heat"],
                              "history": [f"تاريخياً بعد ~{fc['lag_h']:.0f}س من سخونة {fc['from']} تتحرك {b} (ارتباط {fc['corr']:.2f})"]
@@ -3054,12 +3547,221 @@ class Engine:
                 cands.append(cand)
             key = f"rot:{fc['from']}>{b}"
             if sent < int(rc["max_alerts_per_run"]) and now - warned.get(key, 0) >= float(rc["cooldown_hours"]) * 3600:
-                msg = format_rotation(fc, stats[fc["from"]]["label"], stats[b]["label"], [(c, r) for _, c, r in picks],
+                msg = format_rotation(fc, lab_from, stats[b]["label"], [(c, r) for _, c, r in picks],
                                       self.cfg.get("run.timezone"))
                 if self._send(msg):
                     warned[key] = now
                     sent += 1
         return cands
+
+    # ------------------------------------------------------------------ محركات السيولة الكلية والشبكات
+    def _global_from_snapshot(self) -> Optional[dict]:
+        coins = list(self.byid.values())
+        tot = sum(c.mcap for c in coins)
+        if tot <= 0:
+            return None
+        btc = max((c for c in coins if c.symbol == "BTC"), key=lambda c: c.mcap, default=None)
+        return {"mcap": tot, "btc_dom": (btc.mcap / tot * 100.0) if btc else None,
+                "mcap_ch24": sum(c.mcap * (c.ch24h or 0.0) for c in coins) / tot, "vol24": sum(c.volume for c in coins)}
+
+    def _chain_tvl_growth(self) -> dict:
+        agg: dict = {}
+        for r in self.proto_rows:
+            if len(r["chains"]) == 1 and r["d7"] is not None and r["tvl"] >= 3e6:
+                a = agg.setdefault(norm_chain(r["chains"][0]), [0.0, 0.0])
+                a[0] += r["tvl"] * max(-50.0, min(200.0, r["d7"]))
+                a[1] += r["tvl"]
+        return {k: v[0] / v[1] for k, v in agg.items() if v[1] > 0}
+
+    def _chains_refresh(self, mc: dict, now: float) -> None:
+        M = self.s.macro
+        ch = mc.setdefault("chains", {})
+        cc = self.cfg.get("chainflow")
+        ttl, done = float(cc["refresh_hours"]) * 3600, 0
+        for key in sorted(self.cfg.ecosystems, key=lambda k: ch.get(k, {}).get("ts", 0)):
+            e = self.cfg.ecosystems[key]
+            ent = ch.get(key)
+            if ent and now - ent["ts"] < ttl:
+                continue
+            if done >= int(cc["max_per_run"]) or self._time_left() < 150:
+                break
+            if not self._cg_ok("chain:" + key, now):
+                continue
+            name = e.get("chain")
+            slug = e.get("slug") or str(name).lower().replace(" ", "-")
+            st = self._stage("stable_chart", lambda: M.stable_chart(name))
+            dx = self._stage("dex_chain", lambda: M.dex(slug))
+            fe = self._stage("fees_chain", lambda: M.fees(slug))
+            rv = self._stage("rev_chain", lambda: M.revenue(slug))
+            if not (st or dx or fe):
+                self._cg_fail("chain:" + key, now)
+                continue
+            ch[key] = {"ts": now, "stable": st, "dex": {"c7": dx["c7"], "c1": dx["c1"], "t24": dx["t24"]} if dx else None,
+                       "fees": {"c7": fe["c7"], "t24": fe["t24"], "prots": fe["prots"][:100]} if fe else None,
+                       "rev": {"c7": rv["c7"]} if rv else None}
+            done += 1
+        repos = self.cfg.get("dev_repos", {}) or {}
+        if now - mc.get("dev_ts", 0) >= 12 * 3600 and repos and self._time_left() > 200:
+            dev = mc.setdefault("dev", {})
+            for key, lst in repos.items():
+                gs = [r["growth"] for r in (self._stage("commits", lambda repo=repo: M.commits(repo)) for repo in lst or []) if r]
+                if gs:
+                    dev[key] = sum(gs) / len(gs)
+            mc["dev_ts"] = now
+
+    def _macro(self, now: float) -> None:
+        M = self.s.macro
+        if not M or not self.cfg.get("macro.enabled"):
+            return
+        mc = self.state.data.setdefault("macro", {"ts": 0, "hist": [], "stable": None, "dex": None, "glob": None,
+                                                  "chains": {}, "dev": {}, "dev_ts": 0})
+        if self._time_left() > 120:
+            self.derivs = self._stage("derivs", M.derivs, {}) or {}
+        if now - mc["ts"] >= float(self.cfg.get("macro.refresh_minutes")) * 60 and self._cg_ok("macro", now):
+            mc["stable"] = self._stage("stable", M.stable_summary) or mc.get("stable")
+            mc["dex"] = self._stage("dex_global", M.dex) or mc.get("dex")
+            g = None
+            gs = getattr(self.s.cg, "global_stats", None)
+            if gs and self.budget.take(force=True):
+                g = self._stage("global", gs)
+            g = g or self._global_from_snapshot()
+            if g:
+                mc["glob"] = g
+                oi = sum(x["oi_usd"] for x in self.derivs.values())
+                mc["hist"] = [h for h in mc["hist"] if now - h["ts"] <= 9 * 86400][-220:] + [
+                    {"ts": now, "mcap": g["mcap"], "dom": g.get("btc_dom"), "oi": oi or None}]
+            elif not (mc["stable"] or mc["dex"]):
+                self._cg_fail("macro", now)
+            mc["ts"] = now
+        self.glob = global_liquidity({"stable": mc.get("stable"), "glob": mc.get("glob"), "dex": mc.get("dex"),
+                                      "derivs": self.derivs}, mc["hist"], now)
+        self._chains_refresh(mc, now)
+        tvlg = self._chain_tvl_growth()
+        self.chainflow, self.chain_scores, charts, fees = {}, {}, {}, {}
+        for key, e in self.cfg.ecosystems.items():
+            rec = mc["chains"].get(key) or {}
+            cn = norm_chain(e.get("chain"))
+            fl = self.flows.get(cn)
+            res = chain_flow_score({"stable": rec.get("stable"), "tvl_d7": tvlg.get(cn),
+                                    "dex_c7": (rec.get("dex") or {}).get("c7"), "fees_c7": (rec.get("fees") or {}).get("c7"),
+                                    "rev_c7": (rec.get("rev") or {}).get("c7"), "dev_growth": mc.get("dev", {}).get(key),
+                                    "bridge": fl.get("score") if fl else None})
+            if res["score"] is not None and res["coverage"] >= 0.3:
+                self.chainflow[key] = {**res, "label": e.get("label", key)}
+                self.chain_scores[cn] = res["score"]
+            if rec.get("stable"):
+                charts[e.get("label", key)] = rec["stable"]
+            if rec.get("fees"):
+                fees[cn] = rec["fees"]
+        ss = mc.get("stable") or {}
+        self.deploy = stable_deployment(charts, (ss["now"] - ss["d1"]) if ss.get("d1") else None)
+        self.chsec = chain_sector_matrix(self.proto_rows, fees)
+        d1 = (ss["now"] - ss["d1"]) if ss.get("d1") else 0.0
+        warned = self.state.data["warned"]
+        if d1 >= float(self.cfg.get("macro.mint_alert_usd")) and self.deploy and now - warned.get("mint", 0) >= 12 * 3600:
+            if self._send(format_mint(d1, self.deploy, self.glob, self.cfg.get("run.timezone"))):
+                warned["mint"] = now
+
+    def _chain_sector_cands(self, sector_data: dict, natives: dict) -> list:
+        rc = self.cfg.get("chainflow")
+        idx: dict = {}
+        for coins in list(sector_data.values()) + [list(natives.values()), list(self.byid.values())]:
+            for c in coins:
+                if c.symbol not in idx or c.mcap > idx[c.symbol].mcap:
+                    idx[c.symbol] = c
+        cap = float(self.cfg.get("sector.laggard_max_24h"))
+        out = []
+        top = [r for r in self.chsec if r["score"] is not None and r["score"] >= rc["min_sector_score"]
+               and r["g7"] >= rc["min_tvl_growth"]][: int(rc["max_groups"])]
+        for g in top:
+            for sym, tvl, d7 in g["syms"][:6]:
+                coin = idx.get(sym)
+                if not coin or coin.ch24h is None or coin.ch24h > cap or (coin.ch1h is not None and coin.ch1h < -1.5):
+                    continue
+                cn = norm_chain(g["chain"])
+                cand = Candidate(coin=coin, kinds={"chainsector"}, sectors=[f"{g['chain']} · {g['cat']}"],
+                                 src={"src": "cg", "id": coin.id})
+                gap = max(0.0, 0.5 * min(d7, g["g7"]) - coin.ch24h)
+                cand.features = {"sector": clip(g["g7"] / 15.0), "gap": clip(gap / 15.0),
+                                 "momo": clip(max(coin.ch1h or 0.0, 0.0) / 3.0)}
+                cand.reasons = [(2, f"🏗 {g['chain']} · {g['cat']}: TVL {g['g7']:+.1f}% (7أ)"
+                                    + (f" · {g['fees_note']}" if g["fees_note"] else "") + " — السيولة تتجه لهذه الفئة"),
+                                (7, f"TVL {sym} {d7:+.0f}% بينما سعره {coin.ch24h:+.1f}% (لم يلحق)")]
+                cand.meta = {"chain": g["chain"], "gap_pct": gap or None, "heat": g["g7"], "chain_norm": cn,
+                             "daily_vol": None}
+                out.append(cand)
+        return out
+
+    def _path(self, c: Candidate) -> str:
+        parts = []
+        eco = c.meta.get("eco_key")
+        if eco and eco in self.cfg.ecosystems:
+            sym = self.cfg.ecosystems[eco].get("symbol")
+            if sym:
+                parts.append(f"{sym}↑")
+        if c.meta.get("chain"):
+            parts.append(str(c.meta["chain"]))
+        if c.sectors:
+            parts.append(c.sectors[0].split("·")[-1].strip().replace("نظام ", ""))
+        parts.append("#" + c.coin.symbol)
+        out = []
+        for p in parts:
+            if p and p not in out:
+                out.append(p)
+        return " ⟶ ".join(out)
+
+    def _finalize(self, c: Candidate, now: float) -> None:
+        """بعد فحص السلسلة: الحالة، التلاعب، التمويل، السيولة العالمية. تُسجَّل كتعديلات قابلة للتفسير."""
+        coin, adj = c.coin, []
+        dex = c.meta.get("dex")
+        r = self.vr(coin) if c.src.get("src") == "cg" else None
+        cn = norm_chain(c.meta.get("chain") or (dex or {}).get("chain") or "")
+        cs = self.chain_scores.get(cn)
+        if cs is not None and c.features.get("chain") is None:
+            c.features["chain"] = clip(cs / 100.0)
+        qc = self.cfg.get("quality")
+        manip = manipulation_risk(coin, dex, now)
+        c.meta["manip"] = manip
+        if manip["risk"] >= qc["block_manip"]:
+            c.meta["blocked"] = True
+        elif manip["risk"] >= qc["warn_manip"]:
+            adj.append(("خطر تلاعب", -8.0))
+        st = classify_state(coin.ch24h or 0.0, coin.ch1h, r, c.meta.get("whale_usd", 0.0), cs, dex,
+                            whale_inflow=bool(c.meta.get("whale_inflow")))
+        c.meta["state"] = st
+        if st == "DISTRIBUTION":
+            c.meta["blocked"] = True
+        else:
+            pts = {"SEEDING": 4.0, "IGNITION": 3.0, "MARKUP": -6.0, "DORMANT": 0.0}[st]
+            if pts:
+                adj.append((f"حالة {st}", pts))
+        fund = self.derivs.get(coin.symbol)
+        if fund:
+            c.meta["funding"] = fund["funding"]
+            if fund["funding"] > float(qc["hot_funding"]):
+                adj.append(("تمويل محموم", -4.0))
+        g = self.glob.get("score")
+        if g is not None:
+            m = round((g - 50.0) / 50.0 * float(qc["macro_max"]), 1)
+            if abs(m) >= 0.5:
+                adj.append(("السيولة العالمية", m))
+        c.features["accum"] = absorption_score(r, coin.ch1h, coin.ch24h) if r is not None else None
+        c.meta["adj"] = adj
+
+    def _explain(self, c: Candidate, s: float) -> dict:
+        pos = [(FEATURE_AR.get(k, k), p) for k, p in contributions(PRIOR, c.features)[:5] if p >= 1.0]
+        adj = c.meta.get("adj", [])
+        pos += [(n, p) for n, p in adj if p > 0]
+        neg = [(n, p) for n, p in adj if p < 0]
+        if c.meta.get("crowded"):
+            neg.append(("عملة Trending (الجمهور سبقنا)", -float(self.cfg.get("attention.trending_penalty"))))
+        if c.meta.get("late_stage"):
+            neg.append((f"موجة القطاع {c.meta['late_stage']}", -4.0))
+        bt = ((self.K.d.get("backtest") or {}).get("by_sector") or {}).get(c.meta.get("sector_key") or "")
+        return {"attrib": {"pos": pos, "neg": neg}, "prob": calibrated_probability(self.state.data["closed"], s),
+                "state": c.meta.get("state"), "glob": self.glob, "path": self._path(c), "quality": c.meta.get("quality"),
+                "whale_score": c.meta.get("whale_score"), "manip": c.meta.get("manip"), "sm24": c.meta.get("sm24"),
+                "bt": bt if bt and bt.get("n", 0) >= 10 else None}
 
     # ------------------------------------------------------------------ التشغيل
     def run(self) -> dict:
@@ -3092,7 +3794,9 @@ class Engine:
             sector_data, natives = self._stage("market", lambda: self._load_market(now, valid), ({}, {}))
             trending = self._stage("trending", lambda: self._trending(now), set())
         flows = self._stage("bridge", lambda: self._bridge_flows(now), {})
+        self.flows = flows
         self.news_items = self._stage("news", lambda: self._news(now), [])
+        self._stage("macro", lambda: self._macro(now))
 
         self._stage("positions", lambda: self._track_positions(now))
 
@@ -3102,6 +3806,7 @@ class Engine:
         self.summary["sectors"] = stats
         self.stats = stats
         cands += self._stage("rotation", lambda: self._rotation(sector_data, stats, now), [])
+        cands += self._stage("chainsector", lambda: self._chain_sector_cands(sector_data, natives), [])
 
         def waterfall():
             out = []
@@ -3146,11 +3851,14 @@ class Engine:
                 log.warning("اقتراب نفاد زمن التشغيلة: تخطي فحوص السلسلة المتبقية")
                 break
             self._stage("onchain", lambda c=c: self._confirm_onchain(c, events, flows, now))
+        for c in top:
+            self._stage("finalize", lambda c=c: self._finalize(c, now))
 
         threshold = self.brain.threshold()
         scored = []
         for c in top:
             if c.meta.get("blocked"):
+                log.info("حُجبت %s: %s", c.coin.symbol, (c.meta.get("manip") or {}).get("notes") or c.meta.get("state"))
                 continue
             s = self.brain.score(c.features) + min(6.0, 3.0 * (len(c.kinds) - 1))
             if c.coin.id in trending:
@@ -3163,6 +3871,8 @@ class Engine:
             elif stage in ("late", "cooling"):
                 s -= 8.0 if stage == "cooling" else 4.0  # آخر الموجة: مخاطرة أعلى
                 c.meta["late_stage"] = stage
+            for _label, pts in c.meta.get("adj", []):
+                s += pts
             scored.append((s, c))
         scored.sort(key=lambda x: x[0], reverse=True)
         self.summary["near_miss"] = [(round(s, 1), c.coin.symbol, sorted(c.kinds)) for s, c in scored[:6]]
@@ -3177,7 +3887,7 @@ class Engine:
             if not plan:
                 continue
             extra = {"xratio": self.vr(c.coin) if c.coin.live else None, "history": c.meta.get("history"),
-                     "news": c.meta.get("news")}
+                     "news": c.meta.get("news"), **self._explain(c, s)}
             if self.s.judge and judged < int(self.cfg.get("context.llm.max_calls_per_run")):
                 judged += 1
                 verdict = self._stage("llm", lambda c=c, s=s, plan=plan: self.s.judge.review(self._llm_summary(c, s, plan)))
@@ -3268,6 +3978,13 @@ class Engine:
         c.features.setdefault("whale", None)
         c.features.setdefault("dex", None)
         c.features["context"] = self._context(c, now)
+        cn = norm_chain(c.meta.get("chain") or "")
+        c.features["chain"] = clip(self.chain_scores[cn] / 100.0) if cn in self.chain_scores else None
+        btc = self.tickers.get("BTC") if self.tickers else None
+        btc_c = self.byid.get("btc-bitcoin") if self.byid else None
+        c.features["rs"] = relative_strength(coin.ch24h, coin.ch7d, btc["ch24"] if btc else (btc_c.ch24h if btc_c else None),
+                                             btc_c.ch7d if btc_c else None, (self.stats.get(c.meta.get("sector_key") or "") or {}).get("median_24h"))
+        c.features.setdefault("accum", None)
 
     def _passes_gates(self, c: Candidate, now: float) -> bool:
         g = self.cfg.get("gates")
@@ -3288,7 +4005,7 @@ class Engine:
 
     def _identify_dex(self, coin: Coin) -> Optional[dict]:
         dx = self.cfg.get("dex")
-        best = None
+        best, pools = None, 0
         for p in self.s.dex.search(coin.symbol):
             s = summarize_pair(p)
             if not s or s["symbol"] != coin.symbol or s["liq"] < dx["min_liquidity"]:
@@ -3297,8 +4014,11 @@ class Engine:
                 ok = any(v > 0 and dx["identity_low"] <= v / coin.mcap <= dx["identity_high"] for v in (s["mcap"], s["fdv"]))
                 if not ok:
                     continue
+            pools += 1 if s["liq"] >= 50000 else 0
             if best is None or s["liq"] > best["liq"]:
                 best = s
+        if best is not None:
+            best = {**best, "pools": max(1, pools)}
         return best
 
     def _confirm_onchain(self, c: Candidate, events: list, flows: dict, now: float) -> None:
@@ -3351,6 +4071,19 @@ class Engine:
                         if net >= self.cfg.get("whales.min_usd"):
                             c.reasons.append((0, f"🏦 صافي سحب من المنصات {fmt_usd(net)} (90 دقيقة)"))
         c.meta["whale_usd"] = whale_usd
+        mine = [ev for ev in events if key and (ev["chain"], ev["addr"]) == key]
+        c.meta["whale_inflow"] = any(ev["kind"] == "exchange_inflow" for ev in mine)
+        if mine or whale_usd:
+            sm = self.state.data.setdefault("sm", {})
+            hist = [h for h in sm.get("%s:%s" % key, []) if now - h[0] <= 86400] if key else []
+            for ev in mine:
+                hist.append([now, ev["usd"] * ev.get("weight", 1.0) * (-1 if ev["kind"] == "exchange_inflow" else 1)])
+            if key:
+                sm["%s:%s" % key] = hist[-60:]
+            c.meta["sm24"] = sum(h[1] for h in hist)
+            c.meta["whale_score"] = whale_score(mine, whale_usd - sum(ev["usd"] * ev.get("weight", 1.0) for ev in mine
+                                                                     if ev["kind"] in ("accumulation", "exchange_outflow")),
+                                               float(self.cfg.get("whales.min_usd")))
         if checked or self.whale.enabled:
             c.features["whale"] = max(c.features.get("whale") or 0.0, clip(whale_usd / 500000.0))
             if c.features["whale"] >= 0.3:
@@ -3376,6 +4109,11 @@ class Engine:
         plan = build_plan(coin.price, coin.spark, dv, c.meta.get("gap_pct"), flow, book, dex.get("liq", 0.0), wall_usd,
                           tc, rc, self.K.mfe())
         c.meta["plan"] = plan
+        if dex or book:
+            c.meta["quality"] = liquidity_quality(book, dex or None, int(dex.get("pools", 1)) if dex else 0, coin.mcap)
+            q = c.meta["quality"]
+            if q and q["score"] < float(self.cfg.get("quality.min_quality")):
+                c.meta.setdefault("adj", []).append(("جودة سيولة ضعيفة", -6.0))
         return plan
 
     def _fresh_price(self, c: Candidate) -> Optional[float]:
@@ -3585,6 +4323,15 @@ class Engine:
             if not coin or any(s["coin_id"] == cid for s in self.state.data["open"]):
                 continue
             r = self.vr(coin)
+            infl = any(ev["kind"] == "exchange_inflow" and ev["symbol"] == coin.symbol for ev in events)
+            if classify_state(coin.ch24h or 0.0, coin.ch1h, r, 0.0, None, None, whale_inflow=infl) == "DISTRIBUTION" \
+                    and not ((coin.ch24h or 0) >= dc["climax_24h"] and (r or 0) >= dc["climax_vol_ratio"]) \
+                    and self._warn(f"dist:{cid}", now):
+                if self._send(format_warning(coin.symbol, "dump", [
+                        f"حالة DISTRIBUTION: صعود {coin.ch24h:+.1f}% (24س) مع " + ("إيداع حوت في منصة" if infl else f"انعكاس {coin.ch1h or 0:+.1f}% وحجم مرتفع"),
+                        "السعر يرتفع لكن السيولة الذكية تخرج"], False, tz)):
+                    left -= 1
+                continue
             if ((coin.ch24h or 0) >= dc["climax_24h"] and coin.ch1h is not None and coin.ch1h <= dc["climax_pullback_1h"]
                     and (r or 0) >= dc["climax_vol_ratio"] and self._warn(f"climax:{cid}", now)):
                 lines = [f"صعود 24س {coin.ch24h:+.1f}% ثم انعكاس {coin.ch1h:+.1f}% في ساعة",
@@ -3605,7 +4352,18 @@ class Engine:
                  f"📂 صفقات مفتوحة: {len(self.state.data['open'])} | مُقيَّمة: {n}"
                  + (f" | نجاح: {wr * 100:.0f}%" if wr is not None else ""),
                  f"🔌 بيانات لحظية: {self.summary.get('live') or 'غير متاحة (CoinGecko فقط)'}",
-                 f"📊 CoinGecko هذا الشهر: {self.state.data['cg']['used']}/{int(self.budget.monthly)} طلب"]
+                 f"📊 طلبات المصدر هذا الشهر: {self.state.data['cg']['used']}/{int(self.budget.monthly)}"]
+        g = self.glob or {}
+        if g.get("score") is not None:
+            lines.append(f"🌍 السيولة العالمية: {g['score']:.0f}/100 ({ {'ENTERING': 'تدخل ↑', 'EXITING': 'تخرج ↓', 'NEUTRAL': 'محايدة'}.get(g['state'], '') })")
+        if self.chainflow:
+            tops = sorted(self.chainflow.values(), key=lambda x: -x["score"])[:3]
+            lines.append("⛓ أقوى الشبكات: " + " | ".join(f"{t['label']} {t['score']:.0f}" for t in tops))
+        if self.deploy:
+            lines.append("💵 الدولار الجديد يذهب إلى: " + " | ".join(f"{r['chain']} {r['share'] * 100:.0f}%" for r in self.deploy[:3]))
+        hot = [r for r in self.chsec if r["score"] is not None and r["score"] >= 60][:3]
+        if hot:
+            lines.append("🏗 فئات داخل الشبكات: " + " | ".join(f"{r['chain']}·{r['cat']} {r['g7']:+.0f}%" for r in hot))
         if self._send("\n".join(lines)):
             meta["last_heartbeat"] = now
 
@@ -3646,6 +4404,9 @@ REQUIRED_KEYS = {
     "gates": ["max_coin_24h", "max_coin_1h"],
     "live": ["enabled", "exchanges", "match_tolerance", "snapshot_hours", "klines_per_run"],
     "paprika": ["monthly_budget"],
+    "macro": ["enabled", "refresh_minutes", "mint_alert_usd"],
+    "chainflow": ["refresh_hours", "max_per_run", "min_sector_score", "min_tvl_growth", "max_groups"],
+    "quality": ["min_quality", "warn_manip", "block_manip", "hot_funding", "macro_max"],
     "rotation": ["enabled", "min_source_heat", "min_conf", "window_low", "window_high", "max_alerts_per_run", "cooldown_hours",
                  "max_coins", "prior_lag_h", "prior_corr"],
     "sector": ["hot_heat", "min_breadth", "laggard_gap", "laggard_max_24h", "min_corr", "max_7d_dump"],
@@ -3763,6 +4524,9 @@ class _FakeCG:
     def __init__(self, cats, natives=(), prices=None):
         self.cats, self.natives, self._prices, self.calls = cats, list(natives), prices or {}, 0
 
+    def global_stats(self):
+        return {"mcap": 2.3e12, "btc_dom": 54.0, "mcap_ch24": 2.0, "vol24": 9e10}
+
     def markets(self, category=None, ids=None, per_page=60, sparkline=True):
         self.calls += 1
         rows = self.cats.get(category, []) if category else [r for r in self.natives if r["id"] in (ids or [])]
@@ -3795,7 +4559,41 @@ class _FakeLlama:
         return {}
 
     def protocols(self):
-        return {}
+        return dict(getattr(self, "proto", {}) or {})
+
+
+class _FakeMacro:
+    """مزوّد ماكرو وهمي: مستقرات تنمو، حجم DEX يرتفع، تمويل معتدل."""
+
+    def __init__(self, strong=True):
+        self.strong = strong
+
+    def stable_summary(self):
+        k = 1.0 if self.strong else -1.0
+        return {"now": 2.0e11 * (1 + 0.012 * k), "d1": 2.0e11 * (1 + 0.004 * k) - (7e8 if self.strong else 0), "d7": 2.0e11,
+                "d30": 1.9e11}
+
+    def dex(self, chain=None):
+        return {"t24": 5e9, "c1": 3.0, "c7": 25.0 if self.strong else -20.0, "prots": []}
+
+    def fees(self, chain=None):
+        return {"t24": 2e6, "c1": 1.0, "c7": 30.0 if self.strong else -15.0,
+                "prots": [{"cat": "Lending", "t24": 1e6, "c7": 40.0}, {"cat": "Dexs", "t24": 5e5, "c7": 10.0}]}
+
+    def revenue(self, chain=None):
+        return {"t24": 1e6, "c1": 1.0, "c7": 22.0 if self.strong else -10.0, "prots": []}
+
+    def stable_chart(self, chain):
+        up = 1.0 if self.strong else -1.0
+        base = 5e9
+        return {"now": base * (1 + 0.03 * up), "d1_usd": 3e8 * up, "d1_pct": 0.6 * up, "d7_usd": 1.5e8 * up, "d7_pct": 3.0 * up}
+
+    def derivs(self):
+        return {"BTC": {"funding": 12.0, "oi_usd": 3e10, "mark": 60000.0}, "ETH": {"funding": 9.0, "oi_usd": 1.5e10, "mark": 3000.0},
+                "LAG": {"funding": 120.0, "oi_usd": 2e7, "mark": 1.0}}
+
+    def commits(self, repo):
+        return {"last4": 120, "prev4": 90, "growth": 0.33}
 
 
 class _FakeDex:
@@ -3889,7 +4687,7 @@ NOW0 = 1_800_000_000.0
 def _st_cfg(**over):
     base = load_config()
     cfg = Config(copy.deepcopy(base.settings), env={})
-    cfg.settings["run"].update(min_score=50, heartbeat_hours=0)
+    cfg.settings["run"].update(min_score=44, heartbeat_hours=0)
     cfg.settings["coingecko"]["monthly_budget"] = 10 ** 9
     for sec, kv in over.items():
         cfg.settings[sec].update(kv)
@@ -3923,7 +4721,7 @@ def _st_book(p):
 
 
 def _st_engine(tmp, cats=None, tickers=None, book=None, dex_price=None, now=NOW0, cfg=None, xfer=None, dex_tokens=None,
-               state=None, judge=None, news=None):
+               state=None, judge=None, news=None, macro=None, proto=None):
     cfg = cfg or _st_cfg()
     state = state or State(Path(tmp) / "state.json")
     holder = {"t": now}
@@ -3932,7 +4730,9 @@ def _st_engine(tmp, cats=None, tickers=None, book=None, dex_price=None, now=NOW0
     svc = Services(cg=_FakeCG(cats if cats is not None else _st_cats()), llama=_FakeLlama(),
                    dex=_FakeDex(dex_price or lag, dex_tokens),
                    ex=_FakeEx(tickers if tickers is not None else _st_tickers(rows), book if book is not None else _st_book(lag)),
-                   xfer=xfer, notifier=_FakeNotifier(), judge=judge, news=news)
+                   xfer=xfer, notifier=_FakeNotifier(), judge=judge, news=news, macro=macro)
+    if proto:
+        svc.llama.proto = proto
     return Engine(cfg, state, svc, now_fn=lambda: holder["t"]), svc, state, holder
 
 
@@ -4431,6 +5231,140 @@ def _t_backtest_keyless(tmp):
     assert len(got) >= 6 and all(c.mcap >= 1e7 for c in got)
 
 
+def _t_global_liquidity():
+    now = NOW0
+    hist = [{"ts": now - 7 * 86400, "mcap": 2.0e12, "dom": 56.0, "oi": 2.0e10}]
+    inp = {"stable": {"now": 2.0e11 * 1.01, "d1": 2.0e11 * 1.004, "d7": 2.0e11}, "glob": {"mcap": 2.3e12, "btc_dom": 54.0, "mcap_ch24": 2.5},
+           "dex": {"c7": 30.0}, "derivs": {"BTC": {"funding": 10.0, "oi_usd": 2.6e10}, "ETH": {"funding": 8.0, "oi_usd": 1.0e10}}}
+    up = global_liquidity(inp, hist, now)
+    assert up["state"] == "ENTERING" and up["score"] > 62 and len(up["notes"]) >= 5, up
+    inp2 = {"stable": {"now": 2.0e11 * 0.99, "d1": 2.0e11 * 0.996, "d7": 2.0e11}, "glob": {"mcap": 1.8e12, "btc_dom": 58.0, "mcap_ch24": -4.0},
+            "dex": {"c7": -30.0}, "derivs": {"BTC": {"funding": 90.0, "oi_usd": 4e10}}}
+    dn = global_liquidity(inp2, hist, now)
+    assert dn["state"] == "EXITING" and dn["score"] < up["score"], dn
+    assert global_liquidity({}, [], now)["score"] is None
+
+
+def _t_chain_engines():
+    strong = chain_flow_score({"stable": {"d7_pct": 3.5, "d1_pct": 0.7}, "tvl_d7": 18.0, "dex_c7": 40.0, "fees_c7": 40.0,
+                               "rev_c7": 35.0, "dev_growth": 0.4, "bridge": 0.8})
+    weak = chain_flow_score({"stable": {"d7_pct": -1.0, "d1_pct": -0.2}, "tvl_d7": -6.0, "dex_c7": -25.0, "fees_c7": -20.0,
+                             "rev_c7": -15.0, "dev_growth": -0.3, "bridge": 0.05})
+    assert strong["score"] > 80 > 30 > weak["score"] and chain_flow_score({})["score"] is None
+    dep = stable_deployment({"Solana": {"d1_usd": 6e8}, "Base": {"d1_usd": 3e8}, "Tron": {"d1_usd": -1e8}}, 1.2e9)
+    assert [r["chain"] for r in dep] == ["Solana", "Base"] and abs(dep[0]["share"] - 2 / 3) < 1e-9 and abs(dep[0]["of_global"] - 0.5) < 1e-9
+    rows = [{"sym": "AAA", "cat": "Lending", "chains": ["Solana"], "tvl": 5e7, "d1": 1.0, "d7": 30.0},
+            {"sym": "BBB", "cat": "Lending", "chains": ["Solana"], "tvl": 4e7, "d1": 1.0, "d7": 24.0},
+            {"sym": "CCC", "cat": "Dexs", "chains": ["Solana"], "tvl": 9e7, "d1": 0.0, "d7": -3.0},
+            {"sym": "DDD", "cat": "Dexs", "chains": ["Solana"], "tvl": 6e7, "d1": 0.0, "d7": -1.0},
+            {"sym": "EEE", "cat": "Dexs", "chains": ["Solana", "Base"], "tvl": 9e8, "d1": 0.0, "d7": 90.0}]
+    m = chain_sector_matrix(rows, {"solana": {"prots": [{"cat": "Lending", "t24": 1e6, "c7": 50.0}]}})
+    assert m[0]["cat"] == "Lending" and m[0]["score"] > 90 and m[-1]["score"] < 40, m
+    assert absorption_score(2.5, 0.2, 0.5) > 0.8 > absorption_score(2.5, 3.0, 9.0) and absorption_score(None, 0, 0) == 0.0
+
+
+def _t_state_machine():
+    dx_sell = {"buys_h1": 20, "sells_h1": 60}
+    assert classify_state(0.4, 0.1, 1.0, 0.0, None, None) == "DORMANT"
+    assert classify_state(0.8, 0.2, 1.8, 0.0, None, None) == "SEEDING"
+    assert classify_state(0.5, 0.0, 1.0, 200000.0, None, None) == "SEEDING"
+    assert classify_state(3.0, 1.2, 2.0, 0.0, None, None) == "IGNITION"
+    assert classify_state(12.0, 0.5, 1.2, 0.0, None, None) == "MARKUP"
+    assert classify_state(9.0, 0.2, 1.2, 0.0, None, dx_sell) == "DISTRIBUTION"
+    assert classify_state(8.0, 0.2, 1.2, 0.0, None, None, whale_inflow=True) == "DISTRIBUTION"
+    assert relative_strength(5.0, 20.0, -2.0, 0.0, 1.0) > 0.7 > 0.3 > relative_strength(-6.0, -20.0, 2.0, 3.0, 2.0)
+
+
+def _t_risk_engines():
+    coin = Coin("x", "XXX", "Xxx", 1.0, 5e6, 2e7, 0.5, 14.0, 5.0, xvol=2e7)
+    dex = {"liq": 80000.0, "vol_h24": 4e6, "created": (NOW0 - 3600) * 1000.0, "mcap": 5e6, "fdv": 4e7, "buys_h1": 98, "sells_h1": 2}
+    mr = manipulation_risk(coin, dex, NOW0)
+    assert mr["risk"] >= 65 and len(mr["notes"]) >= 4, mr
+    healthy = Coin("y", "YYY", "Yyy", 1.0, 2e8, 1e7, 0.2, 1.0, 2.0)
+    assert manipulation_risk(healthy, {"liq": 2e6, "vol_h24": 3e6, "created": None, "mcap": 2e8, "fdv": 2.5e8, "buys_h1": 60, "sells_h1": 55}, NOW0)["risk"] < 20
+    book = {"asks": [(1.001 + i * 0.001, 50000.0) for i in range(30)], "bids": [(0.999 - i * 0.001, 50000.0) for i in range(30)]}
+    q = liquidity_quality(book, {"liq": 1.2e6}, 4, 1e8)
+    thin = liquidity_quality({"asks": [(1.05, 10.0)], "bids": [(0.9, 10.0)]}, {"liq": 5000.0}, 1, 1e8)
+    assert q["score"] > 70 > 30 > thin["score"]
+    ev = [{"kind": "accumulation", "wallet": "A", "usd": 300000.0, "weight": 1.0}, {"kind": "exchange_outflow", "wallet": "B", "usd": 250000.0, "weight": 0.7}]
+    ws = whale_score(ev, 0.0, 100000.0)
+    assert ws["score"] > 70 and ws["wallets"] == 2 and not ws["inflow"]
+    assert whale_score(ev + [{"kind": "exchange_inflow", "wallet": "C", "usd": 400000.0, "weight": 1.0}], 0.0, 100000.0)["score"] < ws["score"]
+    cl = [{"score": 60 + (i % 10), "y": 1 if i % 4 else 0} for i in range(30)]
+    cp = calibrated_probability(cl, 63)
+    assert cp and 0.5 < cp["p"] < 0.9 and calibrated_probability(cl[:10], 63) is None
+    c = contributions(PRIOR, {"sector": 1.0, "whale": 0.5, "vol": None})
+    assert c[0][0] == "sector" and c[0][1] > c[1][1] > 0
+
+
+def _t_macro_pipeline(tmp):
+    proto = {"map": {}, "rows": [{"sym": "LAG", "cat": "Lending", "chains": ["Solana"], "tvl": 5e7, "d1": 1.0, "d7": 30.0},
+                                 {"sym": "R3", "cat": "Lending", "chains": ["Solana"], "tvl": 4e7, "d1": 1.0, "d7": 24.0}]}
+    eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True), proto=proto)
+    s = eng.run()
+    assert not s["errors"], s["errors"]
+    assert eng.glob["state"] == "ENTERING" and eng.glob["score"] > 62, eng.glob
+    assert eng.chainflow and max(v["score"] for v in eng.chainflow.values()) > 70
+    assert eng.deploy and eng.chsec, (eng.deploy, eng.chsec)
+    assert [m for m in svc.notifier.sent if "ضخ سيولة دولارية" in m], "تنبيه الضخ لم يُرسل"
+    sig = [m for m in svc.notifier.sent if "إشارة شراء" in m and "LAG" in m]
+    assert sig, s["near_miss"]
+    for part in ("السيولة العالمية", "تفسير الدرجة", "🧬", "المسار"):
+        assert part in sig[0], part
+    assert len(sig[0]) <= 4000 and "تحذير" not in sig[0].split("📐")[0]
+    assert state.data["macro"]["hist"] and state.data["macro"]["chains"]
+    eng2, svc2, _, _ = _st_engine(tmp + "_w", macro=_FakeMacro(False))
+    eng2.run()
+    assert eng2.glob["state"] == "EXITING" and eng2.glob["score"] < eng.glob["score"]
+
+
+def _t_leadlag_backtest():
+    rng = np.random.default_rng(7)
+    T = 520
+    fa = rng.normal(0, 0.004, T)
+    for k in range(40, T - 90, 62):  # قفزات قطاع A: +2%/ساعة لـ 3 ساعات
+        fa[k:k + 3] += 0.02
+    fb = rng.normal(0, 0.004, T) + 0.9 * np.roll(fa, 5)  # القطاع B يتبع A بعد 5 ساعات
+    fb[:5] = 0.0
+    fbtc = rng.normal(0, 0.004, T)
+    series = {}
+    for grp, f in (("A", fa), ("B", fb)):
+        for i in range(12):
+            r = f + rng.normal(0, 0.003, T)
+            series[f"{grp}{i}"] = 10 * np.exp(np.cumsum(r))
+    series["BTC"] = 100 * np.exp(np.cumsum(fbtc))
+    coins = {"cat-a": [Coin(f"a{i}", f"A{i}", f"A{i}", 2.5, 5e7, 1e7 + i, 0.5, 3.0, 5.0) for i in range(12)],
+             "cat-b": [Coin(f"b{i}", f"B{i}", f"B{i}", 2.5, 5e7, 1e7 + i, 0.5, 3.0, 5.0) for i in range(12)]}
+
+    class CG:
+        def markets(self, category=None, ids=None, per_page=60, sparkline=False):
+            return list(coins.get(category, []))
+
+    class EX:
+        def klines(self, base, limit=500, pages=1):
+            c = series.get(base)
+            if c is None:
+                return []
+            return [[1_700_000_000_000 + i * 3600_000, c[i], c[i] * 1.003, c[i] * 0.997, c[i], 5e5] for i in range(len(c))][-limit:]
+
+    cfg = _st_cfg(backtest={"candles": 520, "pages": 1, "top_per_group": 12, "min_trades": 1})
+    cfg.sectors = {"a": {"label": "A", "category": "cat-a"}, "b": {"label": "B", "category": "cat-b"}}
+    cfg.ecosystems = {}
+    know = run_backtest(cfg, CG(), EX(), say=lambda *a, **k: None)
+    edges = know["lead_lag"].get("sector:a") or []
+    top = [e for e in edges if e["to"] == "sector:b"]
+    assert top and 2 <= top[0]["lag_h"] <= 9 and top[0]["hit"] >= 0.6 and top[0]["n"] >= 4, know["lead_lag"]
+    kn = Knowledge(know)
+    assert kn.links("a")[0]["to"] == "b" and kn.links("a")[0]["strength"] > 0
+    stats = {"a": {"label": "A", "heat": 8.0, "breadth": 0.8, "stage": "broadening", "hot_since_h": 4.0},
+             "b": {"label": "B", "heat": 0.5, "breadth": 0.5, "stage": "quiet"}}
+    fc = rotation_forecast(stats, kn, _st_cfg(), NOW0)
+    assert fc and fc[0]["to"] == "b" and fc[0]["hit"] >= 0.6 and fc[0]["n"] >= 4
+    nat = Knowledge({"lead_lag": {"native:ETH": [{"to": "sector:b", "lag_h": 8, "hit": 0.7, "excess_pct": 2.0, "n": 9, "conf": 0.6}]}})
+    fn = rotation_forecast({"b": stats["b"]}, nat, _st_cfg(), NOW0, native_hot=[{"sym": "ETH", "ch24": 6.0}])
+    assert fn and fn[0]["from"] == "native:ETH" and "إصابة" in format_rotation(fn[0], "ETH", "B", [], "UTC")
+
+
 def run_offline_selftest(verbose: bool = True) -> tuple:
     import tempfile
     tmp = tempfile.mkdtemp()
@@ -4449,6 +5383,12 @@ def run_offline_selftest(verbose: bool = True) -> tuple:
               ("الوضع المجاني بلا مفتاح (CoinPaprika + شموع البورصات)", _t_bulk_pipeline, True),
               ("مطابقة وسوم القطاعات", _t_membership_tags, False), ("مراحل الموجة وتوقع انتقال السيولة", _t_rotation, False),
               ("الاختبار الرجعي بالوضع المجاني", _t_backtest_keyless, True),
+              ("السيولة العالمية (Global Liquidity Score)", _t_global_liquidity, False),
+              ("قوة الشبكات + نشر الدولار + شبكة×فئة", _t_chain_engines, False),
+              ("آلة الحالات + القوة النسبية + التجميع الصامت", _t_state_machine, False),
+              ("التلاعب + جودة السيولة + Whale Score + الاحتمال", _t_risk_engines, False),
+              ("محرك Lead-Lag (إصابة/وقت/ثقة)", _t_leadlag_backtest, False),
+              ("المحركات الكلية داخل الخط الكامل + التفسير", _t_macro_pipeline, True),
               ("توقع الانتقال داخل الخط الكامل بلا تكرار", _t_rotation_pipeline, True), ("التحصين الأمني (أسرار، HTML، XML)", _t_hardening, False)]
     passed, failed = 0, []
     for name, fn, needs_tmp in checks:
@@ -4495,7 +5435,7 @@ def run_live_checks(cfg, http) -> list:
         add("ok" if not bad else "warn", "فئات القطاعات", "كلها صالحة" if not bad else f"{len(bad)} غير صالحة وستُتجاهل: {', '.join(bad[:12])}")
     ex = Exchanges(http, cfg.get("live.exchanges"))
     t = ex.tickers()
-    add("ok" if t else "fail", "بورصات (أسعار لحظية)", f"{ex.src}: {len(t)} زوج" if t else "كل المصادر فشلت — ستعمل الأداة على CoinGecko فقط")
+    add("ok" if t else "fail", "بورصات (أسعار لحظية)", f"{ex.src}: {len(t)} زوج" if t else "كل المصادر فشلت — ستعمل الأداة بدون أسعار لحظية (بيانات أقدم وتغطية أقل)")
     if t:
         add("ok" if ex.klines("BTC", limit=50) else "warn", "بورصات (شموع للاختبار الرجعي)")
         add("ok" if ex.orderbook("BTC") else "warn", "بورصات (دفتر الأوامر للأهداف)")
@@ -4503,7 +5443,7 @@ def run_live_checks(cfg, http) -> list:
     add("ok" if dl.chains_tvl() else "warn", "DefiLlama (TVL)")
     add("ok" if dl.stablecoin_supply() else "warn", "DefiLlama (مستقرات الشبكات)")
     add("ok" if dl.coin_prices(["bitcoin"]) else "warn", "DefiLlama (أسعار مجانية)")
-    add("ok" if dl.protocols() else "warn", "DefiLlama (بروتوكولات TVL)")
+    add("ok" if (dl.protocols() or {}).get("map") else "warn", "DefiLlama (بروتوكولات TVL)")
     add("ok" if DexScreener(http).search("SOL") else "warn", "DexScreener")
     wl = [w for w in cfg.whales.get("wallets") or [] if valid_wallet(w) and w["chain"] != "solana"]
     bs = Blockscout(http)
@@ -4532,6 +5472,17 @@ def run_live_checks(cfg, http) -> list:
     else:
         add("fail", "Telegram", "TELEGRAM_BOT_TOKEN مفقود (Repository secrets)")
     add("ok" if env.get("ANTHROPIC_API_KEY") else "warn", "مراجعة LLM", "مفعّلة" if env.get("ANTHROPIC_API_KEY") else "اختيارية: بلا ANTHROPIC_API_KEY")
+    M = Macro(http, cfg.env.get("GH_TOKEN"))
+    ss = M.stable_summary()
+    add("ok" if ss else "warn", "DefiLlama المستقرات (السيولة العالمية)", "" if ss else "لا رد؛ ستُتجاهل مكوّنات المستقرات")
+    dx = M.dex()
+    add("ok" if dx else "warn", "DefiLlama حجم DEX/الرسوم", "" if dx else "لا رد")
+    de = M.derivs()
+    add("ok" if de else "warn", "Hyperliquid (تمويل/فائدة مفتوحة)", f"{len(de)} عقد" if de else "لا رد (قد يُحجب من خوادم GitHub)")
+    ch = M.stable_chart("Ethereum")
+    add("ok" if ch else "warn", "DefiLlama مستقرات الشبكات", "" if ch else "لا رد")
+    cm = M.commits("ethereum/go-ethereum")
+    add("ok" if cm else "warn", "GitHub (نشاط المطورين)", "" if cm else "لا رد أو 202 (يُعاد لاحقاً؛ يلزم GH_TOKEN لحد أعلى)")
     return out
 
 
@@ -4543,7 +5494,8 @@ DEFAULT_STATE = os.environ.get("RADAR_STATE", ".radar_state/state.json")
 HOST_INTERVALS = {"api.etherscan.io": 0.25, "api.dexscreener.com": 0.25, "api.mainnet-beta.solana.com": 1.0,
                   "data-api.binance.vision": 0.1, "api.mexc.com": 0.1, "api.gateio.ws": 0.1, "api.kucoin.com": 0.1,
                   "eth.blockscout.com": 0.4, "base.blockscout.com": 0.4, "optimism.blockscout.com": 0.4,
-                  "arbitrum.blockscout.com": 0.4, "polygon.blockscout.com": 0.4, "coins.llama.fi": 0.2, "api.coinpaprika.com": 0.2, "api.llama.fi": 0.2}
+                  "arbitrum.blockscout.com": 0.4, "polygon.blockscout.com": 0.4, "coins.llama.fi": 0.2, "api.coinpaprika.com": 0.2, "api.llama.fi": 0.2, "stablecoins.llama.fi": 0.2,
+                  "api.hyperliquid.xyz": 0.3, "api.github.com": 0.3}
 
 
 def make_http(cfg) -> Http:
@@ -4586,7 +5538,7 @@ def make_services(cfg, http, dry_run: bool = False, notifier=None) -> Services:
                     llama=DefiLlama(http), dex=DexScreener(http),
                     ex=Exchanges(http, cfg.get("live.exchanges")) if cfg.get("live.enabled") else None,
                     xfer=Transfers(eth, Blockscout(http)), eth=eth, sol=sol, news=News(http), judge=judge,
-                    notifier=notifier, know=Knowledge.load())
+                    notifier=notifier, know=Knowledge.load(), macro=Macro(http, env.get("GH_TOKEN")))
 
 
 def capabilities(cfg, svc) -> list:
@@ -4785,9 +5737,12 @@ def cmd_backtest(args) -> int:
         print(f"العتبات المضبوطة: {bt['tuned']} | الصعود التاريخي: {bt.get('mfe_q')}")
     else:
         print("⚠️ لم يُثبت الاختبار ميزة إحصائية موجبة؛ أُبقيت عتباتك كما هي (هذه نتيجة صادقة وليست عطلاً)")
-    for k, v in list(know["sector_flow"].items())[:6]:
-        if v:
-            print(f"  بعد {k} غالباً: " + "، ".join(f"{r['to']} (~{r['lag_h']}س)" for r in v))
+    for k, v in list(know.get("lead_lag", {}).items())[:8]:
+        print(f"  {k} يقود: " + "، ".join(f"{r['to']} (~{r['lag_h']}س، إصابة {r['hit'] * 100:.0f}%، n={r['n']})" for r in v[:3]))
+    if not know.get("lead_lag"):
+        for k, v in list(know["sector_flow"].items())[:6]:
+            if v:
+                print(f"  بعد {k} غالباً: " + "، ".join(f"{r['to']} (~{r['lag_h']}س)" for r in v))
     return 0
 
 
