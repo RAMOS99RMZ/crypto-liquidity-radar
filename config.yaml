@@ -9,6 +9,47 @@ data_source: auto               # auto = CoinGecko إن وُجد مفتاح، و
 paprika:                        # المصدر المجاني: 20,000 طلب/شهر (نستهلك ~4,500)
   monthly_budget: 17000
 
+macro:                          # محرك السيولة العالمية (مصادر مجانية: DefiLlama، Hyperliquid، CoinPaprika/CoinGecko)
+  enabled: true
+  refresh_minutes: 60
+  mint_alert_usd: 500000000     # تنبيه عند ضخ مستقرات جديد ≥ هذا المبلغ خلال 24س مع توزيعه على الشبكات
+
+chainflow:                      # محرك تدفق الشبكات + السيولة داخل الشبكة (شبكة × فئة)
+  refresh_hours: 3
+  max_per_run: 5                # شبكات تُحدَّث لكل تشغيلة (4 طلبات DefiLlama لكل شبكة)
+  min_sector_score: 62          # أدنى SECTOR FLOW SCORE لتوليد مرشحين من فئة داخل شبكة
+  min_tvl_growth: 6.0           # % نمو TVL أسبوعي أدنى
+  max_groups: 3
+
+quality:                        # جودة السيولة والتلاعب والتعديلات
+  min_quality: 35               # أقل جودة سيولة قبل الخصم
+  warn_manip: 35                # خطر تلاعب يستوجب خصماً
+  block_manip: 65               # خطر تلاعب يستوجب الحجب
+  hot_funding: 80               # % تمويل سنوي يُعتبر محموماً
+  macro_max: 5                  # أقصى تعديل (±نقاط) من السيولة العالمية
+
+# مستودعات GitHub لنشاط المطورين (مجاني؛ تُتجاهل الأسماء الخاطئة تلقائياً)
+dev_repos:
+  solana: ["anza-xyz/agave"]
+  ethereum: ["ethereum/go-ethereum"]
+  sui: ["MystenLabs/sui"]
+  arbitrum: ["OffchainLabs/nitro"]
+  optimism: ["ethereum-optimism/optimism"]
+  base: ["base-org/node"]
+  avalanche: ["ava-labs/avalanchego"]
+  bnb: ["bnb-chain/bsc"]
+  near: ["near/nearcore"]
+  aptos: ["aptos-labs/aptos-core"]
+  ton: ["ton-blockchain/ton"]
+  tron: ["tronprotocol/java-tron"]
+  polygon: ["0xPolygon/bor"]
+  sei: ["sei-protocol/sei-chain"]
+  cardano: ["IntersectMBO/cardano-node"]
+  polkadot: ["paritytech/polkadot-sdk"]
+  cosmos: ["cosmos/cosmos-sdk"]
+  injective: ["InjectiveLabs/injective-core"]
+  mantle: ["mantlenetworkio/mantle-v2"]
+
 rotation:                       # توقع انتقال السيولة داخل القطاع وبين القطاعات
   enabled: true
   min_source_heat: 4.0          # أدنى حرارة للقطاع المصدر
