@@ -136,10 +136,15 @@ class Candidate:
 # ======================================================================
 ENV_KEYS = [
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "COINGECKO_API_KEY", "COINGECKO_PLAN",
-    "ETHERSCAN_API_KEY", "SOLANA_RPC_URL", "ANTHROPIC_API_KEY", "GH_TOKEN",
+    "ETHERSCAN_API_KEY", "SOLANA_RPC_URL", "ANTHROPIC_API_KEY", "GH_TOKEN", "HELIUS_API_KEY",
 ]
 ROOT = Path(__file__).resolve().parent
 _MISSING = object()
+
+
+def _clean_secret(v) -> str:
+    """ينظف السر: مسافات وأسطر جديدة وعلامات اقتباس زائدة (خطأ شائع عند اللصق)."""
+    return str(v or "").strip().strip("\"'").strip()
 
 
 class Config:
@@ -149,7 +154,13 @@ class Config:
         self.ecosystems: dict = settings.get("ecosystems") or {}
         self.whales: dict = settings.get("whales") or {}
         # أسرار GitHub غير المعرّفة تصل كنص فارغ -> نعتبرها None
-        self.env = env if env is not None else {k: ((os.environ.get(k) or "").strip() or None) for k in ENV_KEYS}
+        self.env = env if env is not None else {k: (_clean_secret(os.environ.get(k)) or None) for k in ENV_KEYS}
+        sol, hk = self.env.get("SOLANA_RPC_URL"), self.env.get("HELIUS_API_KEY")
+        if sol and not sol.lower().startswith("http"):  # وُضع المفتاح وحده بدل الرابط
+            sol = "https://mainnet.helius-rpc.com/?api-key=" + sol
+        if not sol and hk:
+            sol = "https://mainnet.helius-rpc.com/?api-key=" + hk
+        self.env["SOLANA_RPC_URL"] = sol
 
     def get(self, path: str, default=_MISSING):
         node = self.settings
@@ -189,6 +200,7 @@ class Http:
         self.intervals = intervals or {}
         self._last: dict = {}
         self._fails: dict = {}  # قاطع دائرة: إخفاقات متتالية لكل مضيف
+        self._opened: set = set()
 
     MAX_HOST_FAILS = 3
 
@@ -207,11 +219,14 @@ class Http:
         except (TypeError, ValueError):
             return min(default, 45.0)
 
-    def request(self, method, url, params=None, headers=None, json_body=None, retries: int = 3, text: bool = False):
+    def request(self, method, url, params=None, headers=None, json_body=None, retries: int = 3, text: bool = False,
+                quiet: bool = False):
         parsed = urlparse(url)
         host = parsed.netloc
         if self._fails.get(host, 0) >= self.MAX_HOST_FAILS:
-            log.warning("skipping %s (circuit open after repeated failures)", host)
+            if host not in self._opened:
+                self._opened.add(host)
+                log.warning("تعطيل %s لبقية التشغيلة بعد إخفاقات متكررة", host)
             return None
         for attempt in range(retries):
             self._throttle(host)
@@ -239,7 +254,9 @@ class Http:
                 time.sleep(2.0 * (attempt + 1))
                 continue
             self._fails[host] = 0  # الخادم حيّ (خطأ 4xx خاص بالطلب)
-            log.warning("HTTP %s from %s%s %s", r.status_code, host, redact(parsed.path), redact(r.text[:160].replace("\n", " ")))
+            body = r.text[:160].replace("\n", " ")
+            body = "[صفحة حماية HTML: الموقع يحجب خوادم GitHub]" if body.lstrip().startswith("<") else redact(body)
+            (log.debug if quiet else log.warning)("HTTP %s from %s%s %s", r.status_code, host, redact(parsed.path), body)
             return None
         self._fails[host] = self._fails.get(host, 0) + 1
         return None
@@ -247,11 +264,11 @@ class Http:
     def get_text(self, url, params=None, headers=None, retries: int = 3):
         return self.request("GET", url, params=params, headers=headers, retries=retries, text=True)
 
-    def get_json(self, url, params=None, headers=None, retries: int = 3):
-        return self.request("GET", url, params=params, headers=headers, retries=retries)
+    def get_json(self, url, params=None, headers=None, retries: int = 3, quiet: bool = False):
+        return self.request("GET", url, params=params, headers=headers, retries=retries, quiet=quiet)
 
-    def post_json(self, url, payload, headers=None, retries: int = 3):
-        return self.request("POST", url, json_body=payload, headers=headers, retries=retries)
+    def post_json(self, url, payload, headers=None, retries: int = 3, quiet: bool = False):
+        return self.request("POST", url, json_body=payload, headers=headers, retries=retries, quiet=quiet)
 
 
 # ======================================================================
@@ -597,6 +614,16 @@ class Etherscan:
         self.http = http
         self.key = api_key
 
+    def check(self) -> tuple:
+        """يتحقق من صلاحية المفتاح فعلياً: (ok, رسالة)."""
+        d = self.http.get_json(self.BASE, params={"chainid": 1, "module": "stats", "action": "ethprice", "apikey": self.key},
+                               retries=2, quiet=True)
+        if not isinstance(d, dict):
+            return False, "لا رد من api.etherscan.io"
+        if str(d.get("status")) == "1":
+            return True, f"ETH ≈ ${(d.get('result') or {}).get('ethusd', '?')}"
+        return False, str(d.get("result") or d.get("message") or "مفتاح مرفوض")[:120]
+
     def block_by_time(self, chain_id: int, ts: int) -> Optional[int]:
         d = self.http.get_json(self.BASE, params={"chainid": chain_id, "module": "block", "action": "getblocknobytime",
                                                   "timestamp": int(ts), "closest": "before", "apikey": self.key})
@@ -636,6 +663,14 @@ class SolanaRPC:
     def __init__(self, http, url: Optional[str] = None):
         self.http = http
         self.url = url or "https://api.mainnet-beta.solana.com"
+
+    def health(self) -> tuple:
+        d = self.http.post_json(self.url, {"jsonrpc": "2.0", "id": 1, "method": "getHealth"}, retries=2, quiet=True)
+        if isinstance(d, dict) and d.get("result") == "ok":
+            return True, "getHealth: ok"
+        if isinstance(d, dict) and d.get("error"):
+            return False, str((d["error"] or {}).get("message", "خطأ RPC"))[:120]
+        return False, "لا رد من عقدة سولانا (تحقق من الرابط/المفتاح)"
 
     def token_balances(self, owner: str):
         """{mint: amount} لكل حسابات التوكن لدى المحفظة. None عند الفشل."""
@@ -893,7 +928,7 @@ class Blockscout:
         base = BLOCKSCOUT.get(chain)
         if not base:
             return None
-        d = self.http.get_json(base + path, params=params, retries=2)
+        d = self.http.get_json(base + path, params=params, retries=2, quiet=True)
         return self._norm(d.get("items")) if isinstance(d, dict) and "items" in d else None
 
     def wallet_transfers(self, chain: str, address: str):
@@ -903,22 +938,102 @@ class Blockscout:
         return self._get(chain, f"/api/v2/tokens/{contract}/transfers")
 
 
-class Transfers:
-    """واجهة موحدة: Etherscan (إن وُجد مفتاح) ثم Blockscout المجاني كبديل."""
+RPC_URLS = {
+    "ethereum": ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"],
+    "base": ["https://mainnet.base.org", "https://base-rpc.publicnode.com"],
+    "optimism": ["https://mainnet.optimism.io", "https://optimism-rpc.publicnode.com"],
+    "arbitrum": ["https://arb1.arbitrum.io/rpc", "https://arbitrum-one-rpc.publicnode.com"],
+    "polygon": ["https://polygon-rpc.com", "https://polygon-bor-rpc.publicnode.com"],
+    "bsc": ["https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com"],
+    "avalanche": ["https://api.avax.network/ext/bc/C/rpc", "https://avalanche-c-chain-rpc.publicnode.com"],
+}
+BLOCK_TIME = {"ethereum": 12.0, "base": 2.0, "optimism": 2.0, "arbitrum": 0.26, "polygon": 2.1, "bsc": 0.75, "avalanche": 2.0}
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-    def __init__(self, eth, bs):
-        self.eth, self.bs = eth, bs
+
+class RpcTransfers:
+    """بديل مجاني بلا مفتاح ولا حجب: تحويلات ERC-20 لمحفظة من سجلات eth_getLogs عبر RPC عامة (كل شبكات EVM)."""
+
+    def __init__(self, http):
+        self.http = http
+        self._dec: dict = {}
+
+    def _call(self, chain: str, method: str, params: list):
+        for url in RPC_URLS.get(chain, []):
+            d = self.http.post_json(url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, retries=1, quiet=True)
+            if isinstance(d, dict) and d.get("result") is not None and not d.get("error"):
+                return d["result"]
+        return None
+
+    def _decimals(self, chain: str, token: str) -> int:
+        k = (chain, token)
+        if k not in self._dec:
+            r = self._call(chain, "eth_call", [{"to": token, "data": "0x313ce567"}, "latest"])
+            try:
+                self._dec[k] = int(r, 16) if r and r != "0x" else 18
+            except (TypeError, ValueError):
+                self._dec[k] = 18
+            if not 0 <= self._dec[k] <= 36:
+                self._dec[k] = 18
+        return self._dec[k]
+
+    def wallet(self, chain: str, addr: str, since_ts: float, now: float):
+        """تحويلات المحفظة (دخول وخروج) منذ since_ts بصيغة Etherscan. None عند الفشل."""
+        if chain not in RPC_URLS:
+            return None
+        head = self._call(chain, "eth_blockNumber", [])
+        try:
+            latest = int(head, 16)
+        except (TypeError, ValueError):
+            return None
+        bt = BLOCK_TIME[chain]
+        span = min(int(max(now - since_ts, 60.0) / bt) + 30, 30000)
+        pad = "0x" + "0" * 24 + addr.lower()[2:]
+        out: list = []
+        for topics in ([TRANSFER_TOPIC, None, pad], [TRANSFER_TOPIC, pad]):
+            frm = latest - span
+            while frm <= latest:
+                to = min(latest, frm + 899)
+                logs = self._call(chain, "eth_getLogs", [{"fromBlock": hex(frm), "toBlock": hex(to), "topics": topics}])
+                if logs is None:
+                    return None
+                for lg in logs:
+                    try:
+                        tp = lg["topics"]
+                        if len(tp) != 3:  # ERC-721 أو غيره
+                            continue
+                        tok = str(lg["address"]).lower()
+                        blk = int(lg["blockNumber"], 16)
+                        out.append({"timeStamp": str(int(now - (latest - blk) * bt)), "from": "0x" + tp[1][-40:],
+                                    "to": "0x" + tp[2][-40:], "value": str(int(lg["data"], 16)),
+                                    "tokenDecimal": str(self._decimals(chain, tok)), "tokenSymbol": "", "contractAddress": tok})
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                frm = to + 1
+        return out
+
+
+class Transfers:
+    """واجهة موحدة: Etherscan (مفتاح) ← Blockscout ← RPC عامة (لا تُحجب) كخط أخير."""
+
+    def __init__(self, eth, bs, rpc=None):
+        self.eth, self.bs, self.rpc = eth, bs, rpc
 
     def supports(self, chain: str) -> bool:
-        return bool((self.eth and chain in EVM_CHAIN_IDS_FREE) or (self.bs and chain in BLOCKSCOUT))
+        return bool((self.eth and chain in EVM_CHAIN_IDS_FREE) or (self.bs and chain in BLOCKSCOUT)
+                    or (self.rpc and chain in RPC_URLS))
 
-    def wallet(self, chain: str, addr: str):
+    def wallet(self, chain: str, addr: str, since_ts: Optional[float] = None, now: Optional[float] = None):
         if self.eth and chain in EVM_CHAIN_IDS_FREE:
             r = self.eth.token_transfers(EVM_CHAIN_IDS[chain], address=addr)
             if r is not None:
                 return r
         if self.bs and chain in BLOCKSCOUT:
-            return self.bs.wallet_transfers(chain, addr)
+            r = self.bs.wallet_transfers(chain, addr)
+            if r is not None:
+                return r
+        if self.rpc and chain in RPC_URLS and since_ts is not None:
+            return self.rpc.wallet(chain, addr, since_ts, now or time.time())
         return None
 
     def contract(self, chain: str, contract: str):
@@ -1691,14 +1806,85 @@ def format_signal(cand, score: float, plan: dict, tz: str, extra: Optional[dict]
     return safe_join(L, 3900 - len(tail) - 2) + "\n" + tail
 
 
+STATE_EMO = {"DORMANT": "💤", "SEEDING": "🌱", "IGNITION": "🔥", "MARKUP": "🚀", "DISTRIBUTION": "🔻"}
+LINE_S = "━━━━━━━━━━━━"
+
+
+def _cut(t, n: int = 92) -> str:
+    t = str(t)
+    return t if len(t) <= n else t[: n - 1] + "…"
+
+
+def format_signal_compact(cand, score: float, plan: dict, tz: str, extra: Optional[dict] = None) -> str:
+    """تنبيه مختصر وأنيق: الدخول والوقف والأهداف أولاً، ثم 3 أسباب، ثم سطر أرقام وتفسير."""
+    extra = extra or {}
+    c, e = cand.coin, html.escape
+    st = extra.get("state")
+    L = [f"🟢 <b>#{e(c.symbol)}</b> · {e(c.name[:24])}   🔥<b>{score:.0f}</b>", LINE_S,
+         f"🧭 {e(cand.sectors[0] if cand.sectors else '—')}" + (f" · {STATE_EMO.get(st, '')} {STATE_AR.get(st, '')}" if st else ""),
+         f"💵 <code>${fmt_price(c.price)}</code>   🛑 <code>${fmt_price(plan['stop'])}</code> <b>−{plan['stop_pct']:.1f}%</b>",
+         "🎯 " + " · ".join(f"T{t['k']} <code>${fmt_price(t['price'])}</code> <b>+{t['pct']:.0f}%</b>" for t in plan["targets"][:3]),
+         "⚖️ عائد/مخاطرة " + " · ".join(f"1:{r:.1f}" for r in plan["rr"][:3]), "", "📌 <b>السبب</b>"]
+    L += [f"• {e(_cut(t))}" for _, t in sorted(cand.reasons, key=lambda r: r[0])[:3]]
+    mk = [f"24س {fmt_pct(c.ch24h)}"]
+    if extra.get("xratio"):
+        mk.append(f"حجم ×{extra['xratio']:.1f}")
+    dex = cand.meta.get("dex")
+    if dex:
+        mk.append(f"سيولة {fmt_usd(dex['liq'])}")
+    ws = extra.get("whale_score")
+    if ws and (ws["usd"] or ws["wallets"]):
+        mk.append(f"🐋 {ws['score']:.0f}")
+    if extra.get("quality"):
+        mk.append(f"💧 {extra['quality']['score']:.0f}")
+    if extra.get("manip") and extra["manip"]["risk"] >= 20:
+        mk.append(f"⚠️ تلاعب {extra['manip']['risk']}")
+    L += ["", "📊 " + " · ".join(mk)]
+    walls = []
+    if plan["walls_up"]:
+        w = plan["walls_up"][0]
+        walls.append(f"🧱 بيع ${fmt_price(w['price'])} (~{fmt_usd(w['usd'])})")
+    if plan["walls_dn"]:
+        w = plan["walls_dn"][0]
+        walls.append(f"🛡 شراء ${fmt_price(w['price'])} (~{fmt_usd(w['usd'])})")
+    if walls:
+        L.append(" · ".join(walls))
+    at = extra.get("attrib")
+    if at and (at["pos"] or at["neg"]):
+        pos = " · ".join(f"{p:+.0f} {e(n)}" for n, p in at["pos"][:3])
+        neg = " · ".join(f"{p:+.0f} {e(n)}" for n, p in at["neg"][:2])
+        L.append("📐 " + pos + (f"  │  {neg}" if neg else ""))
+    pr = extra.get("prob")
+    if pr:
+        L.append(f"📈 احتمال النجاح ≈{pr['p'] * 100:.0f}% ({pr['n']} صفقة مماثلة)")
+    if extra.get("llm"):
+        L.append(f"🤖 {e(_cut(extra['llm'], 100))}")
+    g = extra.get("glob") or {}
+    foot = f"⏱ {now_label(tz)}"
+    if g.get("score") is not None:
+        foot = f"🌍 {g['score']:.0f}{ {'ENTERING': '↑', 'EXITING': '↓'}.get(g.get('state'), '') } · " + foot
+    link = safe_url(cand.meta.get("url"))
+    if link:
+        foot += f" · <a href=\"{e(link, quote=True)}\">الرسم</a>"
+    tail = "\n".join(["", foot, "<i>⚠️ ليست نصيحة مالية — التزم بالوقف</i>"])
+    return safe_join(L, 3900 - len(tail) - 2) + "\n" + tail
+
+
 def format_mint(d1: float, rows: list, glob: dict, tz: str) -> str:
-    L = ["💵 <b>ضخ سيولة دولارية جديد</b>", LINE, f"زاد المعروض من العملات المستقرة {fmt_usd(d1)} خلال 24 ساعة.",
-         "", "📍 <b>أين يُنشر هذا الدولار؟</b> (نصيب كل شبكة من الزيادة)"]
+    L = ["💵 <b>ضخ سيولة دولارية جديد</b>", LINE, f"زاد المعروض من العملات المستقرة <b>{fmt_usd(d1)}</b> خلال 24 ساعة.",
+         "", "📍 <b>أين استقر الدولار؟</b>"]
+    tracked = 0.0
     for r in rows[:5]:
-        L.append(f"• {html.escape(str(r['chain']))}: {fmt_usd(r['usd'])} ({r['share'] * 100:.0f}%)")
+        tracked += r["usd"]
+        pct = r.get("of_global")
+        share = f"{pct * 100:.0f}% من الزيادة" if pct is not None else f"{r['share'] * 100:.0f}% من المتتبَّع"
+        L.append(f"• {html.escape(str(r['chain']))}: +{fmt_usd(r['usd'])} ({share})")
+    rest = d1 - tracked
+    if rest > 0.05 * d1:
+        L.append(f"• شبكات أخرى/غير متتبَّعة: +{fmt_usd(rest)}")
     if glob.get("score") is not None:
         L.append(f"\n🌍 السيولة العالمية: {glob['score']:.0f}/100")
-    L += ["", f"⏱ {now_label(tz)}", "<i>إشارة مبكرة: الشبكة التي تستقبل الدولار أولاً غالباً تتحرك أصولها لاحقاً. ليست توصية شراء.</i>"]
+    L += ["", f"⏱ {now_label(tz)}", "<i>إشارة مبكرة فقط: الشبكة التي تستقبل الدولار أولاً غالباً تتحرك أصولها لاحقاً. ليست توصية شراء.</i>"]
     return safe_join(L, 3900)
 
 
@@ -1753,9 +1939,12 @@ class Telegram:
         self.chat_id = chat_id
 
     def send(self, text: str) -> bool:
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
-                   "disable_web_page_preview": True}
+        """يرسل HTML؛ وإن رفضه تيليجرام (وسم غير صالح) يعيد الإرسال نصاً عادياً حتى لا تضيع الإشارة."""
+        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         d = self.http.post_json(self.url, payload)
+        if not (isinstance(d, dict) and d.get("ok")):
+            plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+            d = self.http.post_json(self.url, {"chat_id": self.chat_id, "text": plain[:4000], "disable_web_page_preview": True})
         ok = bool(isinstance(d, dict) and d.get("ok"))
         if not ok:
             log.error("Telegram send failed")
@@ -2023,6 +2212,8 @@ class WhaleBot:
         self.dex = dex
         self.state = state_data
         self._warned_chains: set = set()
+        self.checked = 0
+        self.failed: list = []
         wl = cfg.whales or {}
         self.exchanges = {str(a).lower() for a in (wl.get("exchanges") or {}).values()}
         raw = [x for x in (wl.get("wallets") or []) if isinstance(x, dict) and x.get("address")] + list(extra_wallets or [])
@@ -2054,6 +2245,7 @@ class WhaleBot:
                 elif chain in EVM_CHAIN_IDS and chain not in self._warned_chains:
                     self._warned_chains.add(chain)
                     log.warning("شبكة %s غير مدعومة مجاناً: تم تجاهل محافظها", chain)
+                    self.failed.append(f"{wal.get('label')}@{chain}")
             except Exception as exc:  # محفظة واحدة لا يجب أن تُسقط التشغيلة
                 log.warning("wallet scan failed (%s): %s", wal.get("label"), exc)
         return events
@@ -2062,9 +2254,11 @@ class WhaleBot:
         addr = str(wal["address"]).lower()
         rec = self.state["wallets"]["evm"].setdefault(
             f"{chain}:{addr}", {"last_ts": now - self.w["first_run_lookback_min"] * 60})
-        txs = self.xfer.wallet(chain, addr)
+        txs = self.xfer.wallet(chain, addr, rec["last_ts"], now)
         if txs is None:
+            self.failed.append(f"{wal.get('label', addr[:8])}@{chain}")
             return []
+        self.checked += 1
         last = rec["last_ts"]
         newest = last
         agg: dict = {}
@@ -2122,7 +2316,9 @@ class WhaleBot:
         rec = self.state["wallets"]["sol"].setdefault(owner, {"bal": None})
         bal = self.sol.token_balances(owner)
         if bal is None:
+            self.failed.append(f"{wal.get('label', owner[:6])}@solana")
             return []
+        self.checked += 1
         prev = rec["bal"]
         rec["bal"] = bal
         if prev is None:  # أول تشغيلة: لقطة أساس فقط
@@ -2416,7 +2612,8 @@ class Macro:
         return out
 
     def commits(self, repo: str) -> Optional[dict]:
-        d = self.http.get_json(f"https://api.github.com/repos/{repo}/stats/commit_activity", headers=self.gh or None)
+        d = self.http.get_json(f"https://api.github.com/repos/{repo}/stats/commit_activity", headers=self.gh or None,
+                               quiet=True)
         if not isinstance(d, list) or len(d) < 8:
             return None
         w = [int(x.get("total", 0)) for x in d if isinstance(x, dict)]
@@ -3658,7 +3855,7 @@ class Engine:
         self.chsec = chain_sector_matrix(self.proto_rows, fees)
         d1 = (ss["now"] - ss["d1"]) if ss.get("d1") else 0.0
         warned = self.state.data["warned"]
-        if d1 >= float(self.cfg.get("macro.mint_alert_usd")) and self.deploy and now - warned.get("mint", 0) >= 12 * 3600:
+        if d1 >= float(self.cfg.get("macro.mint_alert_usd")) and self.deploy and now - warned.get("mint", 0) >= 24 * 3600:
             if self._send(format_mint(d1, self.deploy, self.glob, self.cfg.get("run.timezone"))):
                 warned["mint"] = now
 
@@ -3835,6 +4032,7 @@ class Engine:
                 merged[c.coin.id] = c
 
         events = self._stage("whales", lambda: self.whale.scan_wallets(now) if self.whale.enabled else [], [])
+        self.summary["wallets"] = {"checked": self.whale.checked, "failed": list(self.whale.failed)}
         self._stage("distribution", lambda: self._distribution(now, events, flows))
         self._stage("whale_only", lambda: self._add_whale_only(events, merged))
 
@@ -3899,7 +4097,8 @@ class Engine:
                     extra["llm"] = f"{verdict['note']} ({verdict['verdict']}، ثقة {verdict['confidence']:.0f}%)"
                     if s < threshold:
                         continue
-            text = format_signal(c, s, plan, self.cfg.get("run.timezone"), extra)
+            fmt = format_signal if str(self.cfg.get("run.message_style", "compact")) == "full" else format_signal_compact
+            text = fmt(c, s, plan, self.cfg.get("run.timezone"), extra)
             if self._send(text):
                 self._register(c, s, plan, now)
                 self.summary["signals"].append((round(s, 1), c.coin.symbol))
@@ -4341,30 +4540,41 @@ class Engine:
 
     # ------------------------------------------------------------------ نبضة الحياة وتقرير الأخطاء
     def _heartbeat(self, now: float, stats: dict) -> None:
+        """ملخص دوري موجز (كل run.heartbeat_hours): يثبت أن الرادار حيّ ويُظهر أقرب المرشحين وسبب غياب الإشارات."""
         hrs = float(self.cfg.get("run.heartbeat_hours"))
         meta = self.state.data["meta"]
         if hrs <= 0 or not stats or now - meta.get("last_heartbeat", 0) < hrs * 3600:
             return
-        top = sorted(stats.values(), key=lambda s: s["heat"], reverse=True)[:3]
+        e = html.escape
+        top = sorted(stats.values(), key=lambda x: x["heat"], reverse=True)[:3]
         wr, n = self.brain.win_rate()
-        lines = ["📡 <b>الرادار يعمل</b>",
-                 "🔥 أسخن القطاعات: " + " | ".join(f"{s['label'].split('·')[0].strip()} {s['heat']:+.1f}%" for s in top),
-                 f"📂 صفقات مفتوحة: {len(self.state.data['open'])} | مُقيَّمة: {n}"
-                 + (f" | نجاح: {wr * 100:.0f}%" if wr is not None else ""),
-                 f"🔌 بيانات لحظية: {self.summary.get('live') or 'غير متاحة (CoinGecko فقط)'}",
-                 f"📊 طلبات المصدر هذا الشهر: {self.state.data['cg']['used']}/{int(self.budget.monthly)}"]
+        L = ["📡 <b>رادار السيولة · ملخص</b>", LINE_S]
         g = self.glob or {}
         if g.get("score") is not None:
-            lines.append(f"🌍 السيولة العالمية: {g['score']:.0f}/100 ({ {'ENTERING': 'تدخل ↑', 'EXITING': 'تخرج ↓', 'NEUTRAL': 'محايدة'}.get(g['state'], '') })")
+            L.append(f"🌍 السيولة العالمية <b>{g['score']:.0f}/100</b> {({'ENTERING': 'تدخل ↑', 'EXITING': 'تخرج ↓', 'NEUTRAL': 'محايدة'}).get(g['state'], '')}")
+        L.append("🔥 " + " · ".join(f"{e(x['label'].split('·')[0].strip())} {x['heat']:+.1f}%" for x in top))
+        nm = self.summary.get("near_miss", [])[:3]
+        if nm:
+            L.append("🔭 أقرب المرشحين: " + " · ".join(f"{e(sym)} {sc:.0f}" for sc, sym, _ in nm) + f"  (الحد {self.summary.get('threshold')})")
+        else:
+            L.append("🔭 لا مرشحين قريبين الآن")
+        rot = self.summary.get("rotation") or []
+        if rot:
+            L.append("🔄 انتقال متوقع: " + " · ".join(f"{e(str(a).replace('native:', ''))}→{e(str(b))}" for a, b, *_ in rot[:3]))
         if self.chainflow:
             tops = sorted(self.chainflow.values(), key=lambda x: -x["score"])[:3]
-            lines.append("⛓ أقوى الشبكات: " + " | ".join(f"{t['label']} {t['score']:.0f}" for t in tops))
+            L.append("⛓ " + " · ".join(f"{e(t['label'])} {t['score']:.0f}" for t in tops))
         if self.deploy:
-            lines.append("💵 الدولار الجديد يذهب إلى: " + " | ".join(f"{r['chain']} {r['share'] * 100:.0f}%" for r in self.deploy[:3]))
-        hot = [r for r in self.chsec if r["score"] is not None and r["score"] >= 60][:3]
+            L.append("💵 الدولار الجديد → " + " · ".join(f"{e(str(r['chain']))} {(r.get('of_global') if r.get('of_global') is not None else r['share']) * 100:.0f}%" for r in self.deploy[:3]))
+        hot = [r for r in self.chsec if r["score"] is not None and r["score"] >= 60][:2]
         if hot:
-            lines.append("🏗 فئات داخل الشبكات: " + " | ".join(f"{r['chain']}·{r['cat']} {r['g7']:+.0f}%" for r in hot))
-        if self._send("\n".join(lines)):
+            L.append("🏗 " + " · ".join(f"{e(r['chain'])}·{e(r['cat'])} {r['g7']:+.0f}%" for r in hot))
+        w = self.summary.get("wallets")
+        if w:
+            L.append(f"🐋 محافظ: {w['checked']} فُحصت" + (f" · {len(w['failed'])} تعذّرت" if w["failed"] else ""))
+        L.append(f"📈 مفتوحة {len(self.state.data['open'])} · مُقيَّمة {n}" + (f" · نجاح {wr * 100:.0f}%" if wr is not None else ""))
+        L.append(f"📶 {self.summary.get('live') or 'بدون أسعار لحظية'} · معرفة تاريخية {'✓' if self.K.ready else '✗'} · ⏱ {now_label(self.cfg.get('run.timezone'))}")
+        if self._send(safe_join(L, 3900)):
             meta["last_heartbeat"] = now
 
     def _report_errors(self, now: float) -> None:
@@ -4654,7 +4864,7 @@ class _FakeXfer:
     def supports(self, chain):
         return True
 
-    def wallet(self, chain, addr):
+    def wallet(self, chain, addr, since_ts=None, now=None):
         return self.w
 
     def contract(self, chain, contract):
@@ -4671,13 +4881,13 @@ class _FakeHttp:
                 return v
         return None
 
-    def get_json(self, url, params=None, headers=None, retries=3):
+    def get_json(self, url, params=None, headers=None, retries=3, quiet=False):
         return self._find(url)
 
-    def get_text(self, url, params=None, headers=None, retries=3):
+    def get_text(self, url, params=None, headers=None, retries=3, quiet=False):
         return self._find(url)
 
-    def post_json(self, url, payload, headers=None, retries=3):
+    def post_json(self, url, payload, headers=None, retries=3, quiet=False):
         return self._find(url)
 
 
@@ -4687,7 +4897,7 @@ NOW0 = 1_800_000_000.0
 def _st_cfg(**over):
     base = load_config()
     cfg = Config(copy.deepcopy(base.settings), env={})
-    cfg.settings["run"].update(min_score=44, heartbeat_hours=0)
+    cfg.settings["run"].update(min_score=44, heartbeat_hours=0, message_style="full")
     cfg.settings["coingecko"]["monthly_budget"] = 10 ** 9
     for sec, kv in over.items():
         cfg.settings[sec].update(kv)
@@ -5365,6 +5575,127 @@ def _t_leadlag_backtest():
     assert fn and fn[0]["from"] == "native:ETH" and "إصابة" in format_rotation(fn[0], "ETH", "B", [], "UTC")
 
 
+def _t_compact_message(tmp):
+    proto = {"map": {}, "rows": [{"sym": "LAG", "cat": "Lending", "chains": ["Solana"], "tvl": 5e7, "d1": 1.0, "d7": 30.0},
+                                 {"sym": "R3", "cat": "Lending", "chains": ["Solana"], "tvl": 4e7, "d1": 1.0, "d7": 24.0}]}
+    eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True), proto=proto)
+    eng.cfg.settings["run"]["message_style"] = "compact"
+    s = eng.run()
+    msgs = [m for m in svc.notifier.sent if "#LAG" in m and "🎯" in m]
+    assert msgs, s["near_miss"]
+    m = msgs[0]
+    assert len(m) < 1400 and m.count("\n") <= 22, (len(m), m.count("\n"))
+    for part in ("🛑", "T1", "⚖️", "📌", "📊", "📐", "🌍", "ليست نصيحة مالية"):
+        assert part in m, part
+    assert m.count("<b>") == m.count("</b>") and m.count("<code>") == m.count("</code>")
+    assert "ضخ سيولة" not in m
+
+
+def _t_dry_run_isolated(tmp):
+    eng, svc, state, _ = _st_engine(tmp)
+    eng.dry_run = True
+    state.save = lambda: None
+    eng.run()
+    assert not (Path(tmp) / "state.json").exists(), "الوضع التجريبي كتب الحالة"
+
+
+def _t_secrets_and_doctor():
+    rows = secret_rows({"TELEGRAM_BOT_TOKEN": "123456789:" + "A" * 35, "TELEGRAM_CHAT_ID": "-1001234567890",
+                        "ETHERSCAN_API_KEY": "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "SOLANA_RPC_URL": "https://mainnet.helius-rpc.com/?api-key=xyz"})
+    st = {r[1]: r[0] for r in rows}
+    assert st["سر TELEGRAM_BOT_TOKEN"] == st["سر TELEGRAM_CHAT_ID"] == st["سر ETHERSCAN_API_KEY"] == st["سر SOLANA_RPC_URL"] == "ok"
+    assert st["سر COINGECKO_API_KEY"] == "warn"
+    assert "xyz" not in " ".join(r[2] for r in rows), "تسرّب سر في التقرير"
+    bad = {r[1]: r for r in secret_rows({"TELEGRAM_BOT_TOKEN": "notatoken", "TELEGRAM_CHAT_ID": ""})}
+    assert bad["سر TELEGRAM_BOT_TOKEN"][0] == "fail" and bad["سر TELEGRAM_CHAT_ID"][0] == "fail"
+    assert "New repository secret" in bad["سر TELEGRAM_CHAT_ID"][2]
+    # تنظيف: علامات اقتباس ومسافات، ومفتاح Helius وحده
+    import os as _os
+    old = {k: _os.environ.get(k) for k in ("SOLANA_RPC_URL", "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN")}
+    try:
+        _os.environ["SOLANA_RPC_URL"] = '  "abc123def"  '
+        _os.environ["TELEGRAM_BOT_TOKEN"] = "'1:x'\n"
+        _os.environ.pop("HELIUS_API_KEY", None)
+        cc = Config({"sectors": {}, "ecosystems": {}, "whales": {}})
+        assert cc.env["SOLANA_RPC_URL"] == "https://mainnet.helius-rpc.com/?api-key=abc123def" and cc.env["TELEGRAM_BOT_TOKEN"] == "1:x"
+        _os.environ["SOLANA_RPC_URL"] = ""
+        _os.environ["HELIUS_API_KEY"] = "kkk"
+        assert Config({"sectors": {}, "ecosystems": {}, "whales": {}}).env["SOLANA_RPC_URL"].endswith("api-key=kkk")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+def _t_rpc_transfers():
+    addr = "0x" + "ab" * 20
+    pad = "0x" + "0" * 24 + "ab" * 20
+    other = "0x" + "0" * 24 + "cd" * 20
+    tok = "0x" + "11" * 20
+    calls = []
+
+    class H:
+        def post_json(self, url, payload, headers=None, retries=1, quiet=False):
+            m, p = payload["method"], payload["params"]
+            calls.append(m)
+            if m == "eth_blockNumber":
+                return {"result": hex(1_000_000)}
+            if m == "eth_call":
+                return {"result": hex(6)}
+            if m == "eth_getLogs":
+                t = p[0]["topics"]
+                data = hex(2_500_000_000)  # 2500 وحدة بـ 6 خانات عشرية
+                if len(t) == 3 and t[1] is None:   # دخول إلى المحفظة
+                    return {"result": [{"address": tok, "topics": [TRANSFER_TOPIC, other, pad], "data": data,
+                                         "blockNumber": hex(999_990)}, {"address": tok, "topics": [TRANSFER_TOPIC, other, pad, "0x1"], "data": "0x1",
+                                                                       "blockNumber": hex(999_990)}]}
+                return {"result": []}
+            return {}
+
+    rpc = RpcTransfers(H())
+    out = rpc.wallet("base", addr, 1_000_000.0 - 600, 1_000_000.0)
+    assert len(out) == 1 and out[0]["to"] == addr and out[0]["from"] == "0x" + "cd" * 20, out
+    assert int(out[0]["value"]) / 10 ** int(out[0]["tokenDecimal"]) == 2500.0 and out[0]["contractAddress"] == tok
+    assert abs(int(out[0]["timeStamp"]) - (1_000_000 - 10 * 2.0)) < 2  # الكتلة قبل 10 كتل × ثانيتان
+    assert rpc.wallet("nochain", addr, 0.0, 1.0) is None
+    tr = Transfers(None, None, rpc)
+    assert tr.supports("base") and tr.wallet("base", addr, 999_000.0, 1_000_000.0)
+
+    class Bad:
+        def post_json(self, *a, **k):
+            return None
+
+    assert RpcTransfers(Bad()).wallet("base", addr, 0.0, 100.0) is None  # الفشل = None لا استثناء
+
+
+def _t_mint_and_digest(tmp):
+    msg = format_mint(1.14e9, [{"chain": "Ethereum", "usd": 3.6e8, "share": 0.99, "of_global": 0.32},
+                               {"chain": "Base", "usd": 1.8e6, "share": 0.005, "of_global": 0.0016}], {"score": 36.0}, "UTC")
+    assert "32% من الزيادة" in msg and "99%" not in msg and "شبكات أخرى" in msg and len(msg) < 1500
+    eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True))
+    eng.cfg.settings["run"]["heartbeat_hours"] = 6
+    eng.run()
+    d = [m for m in svc.notifier.sent if "ملخص" in m]
+    assert d and "الحد" in d[0] and "🔥" in d[0] and len(d[0]) < 1600, svc.notifier.sent[:2]
+    eng2 = Engine(eng.cfg, state, svc, now_fn=lambda: NOW0 + 600)
+    eng2.run()
+    assert sum("ملخص" in m for m in svc.notifier.sent) == 1, "الملخص تكرر قبل 6 ساعات"
+
+
+def _t_telegram_fallback():
+    sent = []
+
+    class H:
+        def post_json(self, url, payload, headers=None, retries=3, quiet=False):
+            sent.append(payload)
+            return {"ok": False} if payload.get("parse_mode") == "HTML" else {"ok": True}
+
+    ok = Telegram(H(), "1:x", "5").send("<b>مرحبا</b> &amp; <i>اختبار</i>")
+    assert ok and len(sent) == 2 and "parse_mode" not in sent[1] and sent[1]["text"] == "مرحبا & اختبار"
+
+
 def run_offline_selftest(verbose: bool = True) -> tuple:
     import tempfile
     tmp = tempfile.mkdtemp()
@@ -5389,6 +5720,9 @@ def run_offline_selftest(verbose: bool = True) -> tuple:
               ("التلاعب + جودة السيولة + Whale Score + الاحتمال", _t_risk_engines, False),
               ("محرك Lead-Lag (إصابة/وقت/ثقة)", _t_leadlag_backtest, False),
               ("المحركات الكلية داخل الخط الكامل + التفسير", _t_macro_pipeline, True),
+              ("التنبيه المختصر الأنيق", _t_compact_message, True), ("عزل الوضع التجريبي عن الحالة", _t_dry_run_isolated, True),
+              ("الأسرار والتنظيف وأداة doctor", _t_secrets_and_doctor, False), ("بديل RPC لمحافظ EVM (بلا حجب)", _t_rpc_transfers, False),
+              ("رسالة الضخ والملخص الدوري", _t_mint_and_digest, True), ("تيليجرام: رجوع لنص عادي عند رفض HTML", _t_telegram_fallback, False),
               ("توقع الانتقال داخل الخط الكامل بلا تكرار", _t_rotation_pipeline, True), ("التحصين الأمني (أسرار، HTML، XML)", _t_hardening, False)]
     passed, failed = 0, []
     for name, fn, needs_tmp in checks:
@@ -5537,7 +5871,7 @@ def make_services(cfg, http, dry_run: bool = False, notifier=None) -> Services:
     return Services(cg=make_market_provider(cfg, http),
                     llama=DefiLlama(http), dex=DexScreener(http),
                     ex=Exchanges(http, cfg.get("live.exchanges")) if cfg.get("live.enabled") else None,
-                    xfer=Transfers(eth, Blockscout(http)), eth=eth, sol=sol, news=News(http), judge=judge,
+                    xfer=Transfers(eth, Blockscout(http), RpcTransfers(http)), eth=eth, sol=sol, news=News(http), judge=judge,
                     notifier=notifier, know=Knowledge.load(), macro=Macro(http, env.get("GH_TOKEN")))
 
 
@@ -5545,7 +5879,7 @@ def capabilities(cfg, svc) -> list:
     env = cfg.env
     return [("أسعار لحظية (بورصات)", bool(svc.ex)), ("Etherscan", bool(svc.eth)), ("Blockscout (مجاني)", True),
             ("Helius/Solana", bool(svc.sol) and bool(env.get("SOLANA_RPC_URL"))), ("أخبار RSS", bool(svc.news)),
-            ("مراجعة LLM", bool(svc.judge)), ("تيليجرام", isinstance(svc.notifier, Telegram)),
+            ("مراجعة LLM", bool(svc.judge)), ("تيليجرام (إرسال حقيقي)", isinstance(svc.notifier, Telegram)),
             ("معرفة تاريخية", svc.know.ready),
             ("مصدر السوق", True if getattr(svc.cg, "bulk", False) else bool(env.get("COINGECKO_API_KEY")))]
 
@@ -5564,15 +5898,27 @@ def cmd_run(args) -> int:
     svc = make_services(cfg, http, dry_run=args.dry_run)
     log.info("القدرات: %s", " | ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in capabilities(cfg, svc)))
     state = State(args.state)
+    if args.dry_run:
+        state.save = lambda: None  # التجريب لا يلوّث الحالة (كان يستهلك فترات الانتظار ويُسكت الرسائل الحقيقية)
+        log.info("وضع تجريبي: لن تُرسل رسائل ولن تُحفظ الحالة")
     engine = Engine(cfg, state, svc, dry_run=args.dry_run)
     try:
         s = engine.run()
         log.info("تم: قطاعات=%d | إشارات=%s | تحذيرات=%s | أقرب=%s | حد=%s | أسعار=%s | أخطاء=%d", len(s["sectors"]),
                  s["signals"], s["warnings"], s["near_miss"][:3], s.get("threshold"), s.get("live"), len(s["errors"]))
         engine.write_step_summary()
+        if (not args.dry_run and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                and isinstance(svc.notifier, Telegram)):  # تشغيل يدوي: نؤكد وصول الرسائل
+            nm = s["near_miss"][:3]
+            svc.notifier.send(safe_join([
+                "✅ <b>تشغيلة يدوية ناجحة</b>", LINE,
+                f"قطاعات: {len(s['sectors'])} · إشارات: {len(s['signals'])} · تحذيرات: {len(s['warnings'])} · أخطاء: {len(s['errors'])}",
+                ("أقرب المرشحين: " + " · ".join(f"{sym} {sc:.0f}" for sc, sym, _ in nm) + f" (الحد {s.get('threshold')})") if nm
+                else "لا مرشحين قريبين الآن (السوق هادئ أو البيانات قيد التجهيز)",
+                "الإرسال إلى القناة يعمل ✔"], 3900))
         return 0
     finally:
-        state.save()  # نحفظ الحالة حتى لو حدث خطأ متأخر
+        state.save()  # نحفظ الحالة حتى لو حدث خطأ متأخر (لا يعمل في الوضع التجريبي)
 
 
 def _print_live(rows: list) -> int:
@@ -5662,7 +6008,10 @@ def cmd_test_telegram(args) -> int:
                 "walls_dn": [{"price": p * 0.96, "usd": 90000.0, "dist_pct": -4.0}], "ceiling": None,
                 "flow_usd": 320000.0, "has_book": True}
         tz = cfg.get("run.timezone")
-        tg.send(format_signal(cand, 74.0, plan, tz, {"xratio": 2.1, "history": ["تلحق قطاعها عادةً بعد ~6 ساعات (ارتباط تاريخي 0.62)"]}))
+        sample = {"xratio": 2.1, "state": "SEEDING", "glob": {"score": 68.0, "state": "ENTERING"},
+                  "attrib": {"pos": [("سخونة القطاع", 15.0), ("فجوة اللحاق", 12.0), ("الحيتان", 9.0)], "neg": [("تمويل محموم", -4.0)]},
+                  "whale_score": {"score": 82.0, "wallets": 2, "usd": 320000.0}, "quality": {"score": 74.0, "notes": []}}
+        tg.send(format_signal_compact(cand, 74.0, plan, tz, sample))
         tg.send(format_warning("DEMO", "dump", ["محفظة DWF Labs أودعت $410K من DEMO في منصة مركزية",
                                                 "إيداع الحيتان في المنصات غالباً يسبق البيع"], True, tz))
     print("تم الإرسال" if ok else "فشل الإرسال: تحقق من التوكن والـ chat id (وأرسل /start للبوت أو أضف البوت مشرفاً في القناة)")
@@ -5764,6 +6113,179 @@ def cmd_stats(args) -> int:
     return 0
 
 
+SECRET_RULES = [
+    ("TELEGRAM_BOT_TOKEN", True, r"\d{6,}:[A-Za-z0-9_-]{30,}", "التوكن من @BotFather ويحوي نقطتين"),
+    ("TELEGRAM_CHAT_ID", True, r"-?\d{5,}|@[A-Za-z0-9_]{4,}", "رقم المحادثة (للقنوات يبدأ غالباً بـ -100)"),
+    ("COINGECKO_API_KEY", False, r"CG-[A-Za-z0-9]{10,}", "اختياري؛ يبدأ بـ CG-"),
+    ("ETHERSCAN_API_KEY", False, r"[A-Za-z0-9]{28,40}", "اختياري؛ 32-34 حرفاً"),
+    ("SOLANA_RPC_URL", False, r"https?://\S+", "اختياري؛ رابط Helius كامل https://mainnet.helius-rpc.com/?api-key=..."),
+    ("ANTHROPIC_API_KEY", False, r"sk-ant-\S+", "اختياري (مدفوع)"),
+]
+WHERE = "أضفه في Settings ▸ Secrets and variables ▸ Actions ▸ تبويب Secrets ▸ New repository secret (وليس Variables ولا Environments) بنفس الاسم تماماً"
+
+
+def secret_rows(env: dict) -> list:
+    """فحص وجود وشكل كل سر دون كشف قيمته."""
+    rows = []
+    for name, required, pat, hint in SECRET_RULES:
+        v = env.get(name)
+        if not v:
+            rows.append(("fail" if required else "warn", f"سر {name}", f"غير موجود في بيئة التشغيل. {hint}. {WHERE}"))
+            continue
+        shown = urlparse(v).netloc if name == "SOLANA_RPC_URL" else (f"{v[:3]}…{v[-2:]}" if len(v) > 10 else "***")
+        ok = bool(re.fullmatch(pat, v))
+        rows.append(("ok" if ok else "fail", f"سر {name}", f"{shown} ({len(v)} حرفاً)" if ok else f"موجود لكن شكله غير صحيح ({shown}). {hint}"))
+    return rows
+
+
+def telegram_diag(http, token: str, chat: str) -> list:
+    rows = []
+    base = f"https://api.telegram.org/bot{token}"
+    me = http.get_json(base + "/getMe", retries=2, quiet=True)
+    if not (isinstance(me, dict) and me.get("ok")):
+        return [("fail", "تيليجرام: التوكن", "مرفوض من تيليجرام (توكن خاطئ أو ملغى). أنشئ توكناً جديداً من @BotFather")]
+    uname = (me.get("result") or {}).get("username", "?")
+    rows.append(("ok", "تيليجرام: التوكن", f"البوت @{uname}"))
+    ch = http.get_json(base + "/getChat", params={"chat_id": chat}, retries=2, quiet=True)
+    if not (isinstance(ch, dict) and ch.get("ok")):
+        rows.append(("fail", "تيليجرام: chat id", "تعذّر الوصول للمحادثة. للمحادثة الخاصة: أرسل /start للبوت. للقناة: أضف البوت مشرفاً "
+                                                   "وتأكد أن المعرّف يبدأ بـ -100"))
+        return rows
+    info = ch["result"]
+    kind = info.get("type")
+    rows.append(("ok", "تيليجرام: chat id", f"{kind}: {info.get('title') or info.get('username') or info.get('first_name') or ''}"))
+    if kind in ("channel", "supergroup", "group"):
+        bid = (me.get("result") or {}).get("id")
+        mem = http.get_json(base + "/getChatMember", params={"chat_id": chat, "user_id": bid}, retries=2, quiet=True)
+        res = (mem or {}).get("result") if isinstance(mem, dict) else None
+        if res and res.get("status") in ("administrator", "creator"):
+            if kind == "channel" and res.get("can_post_messages") is False:
+                rows.append(("fail", "تيليجرام: صلاحية النشر", "البوت مشرف لكن بلا صلاحية «نشر الرسائل». فعّلها له في القناة"))
+            else:
+                rows.append(("ok", "تيليجرام: صلاحية البوت", "مشرف"))
+        else:
+            rows.append(("fail", "تيليجرام: صلاحية البوت", "البوت ليس مشرفاً في القناة/المجموعة. أضفه مشرفاً"))
+    return rows
+
+
+def doctor_checks(cfg, http) -> list:
+    """فحص شامل: الأسرار + صحة كل مفتاح فعلياً + المزوّدين + المحافظ."""
+    env = cfg.env
+    rows = secret_rows(env)
+    if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
+        rows += telegram_diag(http, env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"])
+    if env.get("ETHERSCAN_API_KEY"):
+        ok, msg = Etherscan(http, env["ETHERSCAN_API_KEY"]).check()
+        rows.append(("ok" if ok else "fail", "Etherscan: المفتاح", msg if ok else f"مرفوض: {msg}"))
+        eth = Etherscan(http, env["ETHERSCAN_API_KEY"])
+        t = eth.token_transfers(1, address="0x28c6c06298d514db089934071355e5743bf21d60", offset=1)
+        rows.append(("ok" if t is not None else "warn", "Etherscan: تحويلات إيثريوم", "تعمل" if t is not None else "لم تُرجع بيانات (حد المعدل؟)"))
+    if env.get("SOLANA_RPC_URL"):
+        sol = SolanaRPC(http, env["SOLANA_RPC_URL"])
+        ok, msg = sol.health()
+        rows.append(("ok" if ok else "fail", "Helius/Solana: الاتصال", msg))
+        if ok:
+            wal = next((w for w in cfg.whales.get("wallets") or [] if str(w.get("chain")).lower() == "solana"), None)
+            if wal:
+                bal = sol.token_balances(str(wal["address"]))
+                rows.append(("ok" if bal is not None else "fail", "Helius/Solana: قراءة محفظة",
+                             f"{len(bal)} توكن" if bal is not None else "فشل getTokenAccountsByOwner (الخطة/المفتاح؟)"))
+    svc = make_services(cfg, http, dry_run=True)
+    wallets = [w for w in cfg.whales.get("wallets") or [] if valid_wallet(w)]
+    wb = WhaleBot(cfg, svc.xfer, svc.sol, svc.dex, default_state())
+    wb.wallets = wallets[:25]
+    wb.scan_wallets(time.time())
+    rows.append(("ok" if wb.checked and not wb.failed else ("warn" if wb.checked else "fail"), "محافظ الحيتان",
+                 f"{wb.checked} فُحصت" + (f" · تعذّر: {', '.join(wb.failed[:6])}" if wb.failed else "")))
+    return rows
+
+
+def verdict(rows: list) -> tuple:
+    n = {"ok": 0, "warn": 0, "fail": 0}
+    for r in rows:
+        n[r[0]] += 1
+    return n
+
+
+def cmd_doctor(args) -> int:
+    """الفحص الشامل: إعدادات، أسرار، مفاتيح، مزوّدون، 35 فحصاً ذاتياً، ثم تشغيلة تجريبية كاملة، وتقرير لتيليجرام."""
+    import tempfile
+    t0 = time.time()
+    cfg = load_config()
+    http = make_http(cfg)
+    rows: list = []
+    errors, warns = validate_config(cfg)
+    rows += [("fail", "config.yaml", e) for e in errors] + [("warn", "config.yaml", w) for w in warns]
+    if not errors:
+        rows.append(("ok", "config.yaml", f"{len(cfg.sectors)} قطاعاً · {len(cfg.ecosystems)} نظاماً · {len(cfg.whales.get('wallets') or [])} محفظة"))
+    print("═══ 1) الأسرار والمفاتيح والمزوّدون ═══")
+    live = doctor_checks(cfg, http)
+    rows += live
+    _print_live(live)
+    print("\n═══ 2) التحقق الذاتي من الكود (بيانات اصطناعية) ═══")
+    passed, failed = run_offline_selftest(verbose=False)
+    rows.append(("ok" if not failed else "fail", "الفحوص الذاتية", f"{passed}/{passed + len(failed)} ناجحة" + ("" if not failed else " — فاشل: " + ", ".join(n for n, _ in failed))))
+    print(f"  {passed}/{passed + len(failed)} فحص ناجح")
+    print("\n═══ 3) تشغيلة تجريبية كاملة (بلا أي أثر على حالتك) ═══")
+
+    class Cap:
+        def __init__(self):
+            self.sent: list = []
+
+        def send(self, text):
+            self.sent.append(text)
+            return True
+
+    cfg.settings["run"]["time_budget_sec"] = 240
+    cfg.settings["live"]["klines_per_run"] = min(int(cfg.get("live.klines_per_run")), 25)
+    cap = Cap()
+    svc = make_services(cfg, http, dry_run=True, notifier=cap)
+    log.info("القدرات: %s", " | ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in capabilities(cfg, svc)))
+    st = State(os.path.join(tempfile.mkdtemp(), "doctor.json"))
+    s: dict = {}
+    try:
+        s = Engine(cfg, st, svc, dry_run=True).run()
+        n_sec = len(s["sectors"])
+        rows.append(("ok" if n_sec >= 5 else ("warn" if n_sec else "fail"), "تشغيلة تجريبية",
+                     f"{n_sec} قطاعاً حُمّلت · أسعار لحظية: {s.get('live') or 'لا'} · إشارات {len(s['signals'])} · أخطاء داخلية {len(s['errors'])}"))
+        for e in s["errors"][:5]:
+            rows.append(("fail", "خطأ داخلي", e[:200]))
+        if s["near_miss"]:
+            rows.append(("ok", "أقرب المرشحين", " · ".join(f"{sym} {sc:.0f}" for sc, sym, _ in s["near_miss"][:4]) + f" (الحد {s.get('threshold')})"))
+    except Exception as exc:  # الفحص يجب ألا ينهار أبداً
+        rows.append(("fail", "تشغيلة تجريبية", f"{exc.__class__.__name__}: {exc}"))
+    print("\n═══ النتيجة ═══")
+    n = verdict(rows)
+    for status, name, detail in rows:
+        if status != "ok":
+            print(f"  {'❌' if status == 'fail' else '⚠️ '} {name}: {detail}")
+    ok_all = n["fail"] == 0
+    print(f"\n  ✅ {n['ok']}   ⚠️ {n['warn']}   ❌ {n['fail']}   ·  {time.time() - t0:.0f} ثانية")
+    print("  " + ("كل شيء جاهز ✅" if ok_all else "يوجد ما يجب إصلاحه ❌ (التفاصيل أعلاه)"))
+    # تقرير تيليجرام + ملخص GitHub
+    token, chat = cfg.env.get("TELEGRAM_BOT_TOKEN"), cfg.env.get("TELEGRAM_CHAT_ID")
+    lines = ["🩺 <b>تقرير فحص الرادار</b>", LINE, f"✅ {n['ok']}   ⚠️ {n['warn']}   ❌ {n['fail']}"]
+    for status, name, detail in rows:
+        if status != "ok":
+            lines.append(f"{'❌' if status == 'fail' else '⚠️'} <b>{html.escape(name)}</b>: {html.escape(detail[:140])}")
+    lines.append("\n" + ("🟢 جاهز للعمل" if ok_all else "🔴 أصلح البنود ❌ ثم أعد الفحص"))
+    if cap.sent:
+        lines.append(f"(التشغيلة التجريبية ولّدت {len(cap.sent)} رسالة محجوزة لم تُرسل)")
+    if token and chat:
+        sent = Telegram(http, token, chat).send(safe_join(lines, 3900))
+        print("  " + ("📨 أُرسل التقرير إلى تيليجرام" if sent else "⚠️ تعذّر إرسال التقرير إلى تيليجرام (راجع بنود تيليجرام أعلاه)"))
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("### 🩺 تقرير الفحص الشامل\n\n| الحالة | البند | التفاصيل |\n|---|---|---|\n")
+                for status, name, detail in rows:
+                    f.write(f"| {'✅' if status == 'ok' else ('⚠️' if status == 'warn' else '❌')} | {name} | {detail[:200].replace('|', '/')} |\n")
+        except OSError:
+            pass
+    return 0 if ok_all else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="radar", description="رادار شلال السيولة للكريبتو")
     ap.add_argument("--state", default=DEFAULT_STATE)
@@ -5778,13 +6300,14 @@ def main(argv=None) -> int:
     b = sub.add_parser("backtest", help="الاختبار الرجعي وحفظ knowledge.json")
     b.add_argument("--out", default=str(KNOWLEDGE_PATH))
     sub.add_parser("stats", help="إحصائيات التعلّم الذاتي")
+    sub.add_parser("doctor", help="الفحص الشامل: الأسرار والمفاتيح والمزوّدون والكود وتشغيلة تجريبية + تقرير تيليجرام")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
     cmd = args.cmd or "run"
     if cmd == "run" and not hasattr(args, "dry_run"):
         args.dry_run = False
     handlers = {"run": cmd_run, "check": cmd_check, "selftest": cmd_selftest, "test-telegram": cmd_test_telegram,
-                "backtest": cmd_backtest, "stats": cmd_stats}
+                "backtest": cmd_backtest, "stats": cmd_stats, "doctor": cmd_doctor}
     return handlers[cmd](args)
 
 
