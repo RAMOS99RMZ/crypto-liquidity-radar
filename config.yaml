@@ -47,7 +47,6 @@ dev_repos:
   cardano: ["IntersectMBO/cardano-node"]
   polkadot: ["paritytech/polkadot-sdk"]
   cosmos: ["cosmos/cosmos-sdk"]
-  injective: ["InjectiveLabs/injective-core"]
   mantle: ["mantlenetworkio/mantle-v2"]
 
 rotation:                       # توقع انتقال السيولة داخل القطاع وبين القطاعات
@@ -85,7 +84,8 @@ run:
   min_score: 58                 # الحد الأدنى لقوة الإشارة (0-100). يتكيّف تلقائياً مع نتائج التعلّم
   max_alerts_per_run: 3         # أقصى عدد تنبيهات شراء في التشغيلة الواحدة
   cooldown_hours: 12            # لا يُعاد تنبيه نفس العملة قبل مرور هذه المدة
-  heartbeat_hours: 24           # رسالة "الرادار يعمل" كل N ساعة (0 = تعطيل)
+  heartbeat_hours: 6            # ملخص دوري كل N ساعة (0 = تعطيل): يُثبت أن الرادار حيّ ويعرض أقرب المرشحين
+  message_style: compact        # compact = تنبيه مختصر أنيق | full = تفصيلي كامل
   notify_outcomes: true         # إرسال نتيجة كل صفقة عند إغلاقها
   dex_confirm_top: 8            # عدد المرشحين الذين يُفحصون على DEX/On-Chain في كل تشغيلة
 
