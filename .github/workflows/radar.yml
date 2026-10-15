@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "نمط التشغيل اليدوي"
+        description: "نمط التشغيل اليدوي (الجدولة تعمل دائماً بنمط run الحقيقي)"
         type: choice
-        default: dry_run
+        default: doctor
         options:
-          - dry_run          # تشغيلة تجريبية بدون تيليجرام
-          - run              # تشغيلة حقيقية
+          - doctor           # الفحص الشامل: الأسرار + المفاتيح + المزوّدون + الكود + تشغيلة تجريبية + تقرير تيليجرام (ابدأ بهذا)
+          - run              # تشغيلة حقيقية (ترسل لتيليجرام وتحفظ الحالة)
+          - dry_run          # تجريبية: لا ترسل ولا تحفظ شيئاً
           - selftest         # التحقق الذاتي من الكود + فحص المزوّدين
           - test_telegram    # رسائل اختبار بشكل التنبيهات
 
@@ -26,15 +27,18 @@ concurrency:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+      # الاسم الأول هو المعتمد؛ البدائل تلتقط الخطأ الشائع (إضافة السر كـ Variable أو بأسماء مشابهة)
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || vars.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || vars.TELEGRAM_CHAT_ID }}
+      COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY || vars.COINGECKO_API_KEY }}
       COINGECKO_PLAN: ${{ secrets.COINGECKO_PLAN }}
-      ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
-      SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+      ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY || vars.ETHERSCAN_API_KEY }}
+      SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL || vars.SOLANA_RPC_URL }}
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY || vars.HELIUS_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GH_TOKEN: ${{ github.token }}   # نشاط المطورين من GitHub (تلقائي، لا تضفه كسر)
     steps:
       - uses: actions/checkout@v4
 
@@ -53,6 +57,10 @@ jobs:
           restore-keys: |
             radar-state-
 
+      - name: Doctor (الفحص الشامل)
+        if: ${{ inputs.mode == 'doctor' }}
+        run: python radar.py doctor
+
       - name: Self-test
         if: ${{ inputs.mode == 'selftest' }}
         run: python radar.py selftest
@@ -66,17 +74,16 @@ jobs:
         run: python radar.py run ${{ inputs.mode == 'dry_run' && '--dry-run' || '' }}
 
       - name: Save state
-        if: always()
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.mode == 'run') }}
         uses: actions/cache/save@v4
         with:
           path: .radar_state
           key: radar-state-${{ github.run_id }}
 
       - name: Prune old state caches
-        if: always()
+        if: ${{ always() && (github.event_name == 'schedule' || inputs.mode == 'run') }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           gh cache list --key radar-state- --sort created_at --order desc --limit 100 --json id --jq '.[8:] | .[].id' \
