@@ -940,7 +940,8 @@ class Blockscout:
 
 RPC_URLS = {
     "ethereum": ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"],
-    "base": ["https://mainnet.base.org", "https://base-rpc.publicnode.com"],
+    "base": ["https://mainnet.base.org", "https://base-rpc.publicnode.com", "https://base.llamarpc.com", "https://1rpc.io/base",
+             "https://base.drpc.org"],
     "optimism": ["https://mainnet.optimism.io", "https://optimism-rpc.publicnode.com"],
     "arbitrum": ["https://arb1.arbitrum.io/rpc", "https://arbitrum-one-rpc.publicnode.com"],
     "polygon": ["https://polygon-rpc.com", "https://polygon-bor-rpc.publicnode.com"],
@@ -954,15 +955,22 @@ TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 class RpcTransfers:
     """بديل مجاني بلا مفتاح ولا حجب: تحويلات ERC-20 لمحفظة من سجلات eth_getLogs عبر RPC عامة (كل شبكات EVM)."""
 
-    def __init__(self, http):
+    def __init__(self, http, overrides: Optional[dict] = None):
         self.http = http
         self._dec: dict = {}
+        self.over = {k: v for k, v in (overrides or {}).items() if v}
+        self.err: dict = {}
+
+    def urls(self, chain: str) -> list:
+        return ([self.over[chain]] if chain in self.over else []) + RPC_URLS.get(chain, [])
 
     def _call(self, chain: str, method: str, params: list):
-        for url in RPC_URLS.get(chain, []):
+        for url in self.urls(chain):
             d = self.http.post_json(url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, retries=1, quiet=True)
             if isinstance(d, dict) and d.get("result") is not None and not d.get("error"):
                 return d["result"]
+            self.err[chain] = (str((d.get("error") or {}).get("message", "خطأ RPC"))[:90] if isinstance(d, dict) and d.get("error")
+                               else "لا رد/محجوب")
         return None
 
     def _decimals(self, chain: str, token: str) -> int:
@@ -991,11 +999,15 @@ class RpcTransfers:
         pad = "0x" + "0" * 24 + addr.lower()[2:]
         out: list = []
         for topics in ([TRANSFER_TOPIC, None, pad], [TRANSFER_TOPIC, pad]):
-            frm = latest - span
+            frm, chunk, retries = latest - span, 899, 0
             while frm <= latest:
-                to = min(latest, frm + 899)
+                to = min(latest, frm + chunk)
                 logs = self._call(chain, "eth_getLogs", [{"fromBlock": hex(frm), "toBlock": hex(to), "topics": topics}])
                 if logs is None:
+                    why = self.err.get(chain, "").lower()
+                    if chunk > 60 and retries < 3 and any(w in why for w in ("range", "limit", "exceed", "too many", "block")):
+                        chunk, retries = max(50, chunk // 4), retries + 1  # العقدة ترفض النطاق الكبير: نصغّره
+                        continue
                     return None
                 for lg in logs:
                     try:
@@ -1018,12 +1030,27 @@ class Transfers:
 
     def __init__(self, eth, bs, rpc=None):
         self.eth, self.bs, self.rpc = eth, bs, rpc
+        self.errors: dict = {}
 
     def supports(self, chain: str) -> bool:
         return bool((self.eth and chain in EVM_CHAIN_IDS_FREE) or (self.bs and chain in BLOCKSCOUT)
                     or (self.rpc and chain in RPC_URLS))
 
+    def why(self, chain: str) -> str:
+        """سبب فشل مصادر الشبكة (للتشخيص)."""
+        return " · ".join(self.errors.get(chain, [])) or "غير معروف"
+
     def wallet(self, chain: str, addr: str, since_ts: Optional[float] = None, now: Optional[float] = None):
+        r = self._wallet(chain, addr, since_ts, now)
+        if r is None:
+            rpc_err = (self.rpc.err.get(chain) if self.rpc else None)
+            self.errors[chain] = [x for x in (
+                "Etherscan: غير مدعوم/مرفوض" if self.eth and chain in EVM_CHAIN_IDS_FREE else ("Etherscan: بلا مفتاح/غير مدعوم" if chain not in EVM_CHAIN_IDS_FREE else None),
+                "Blockscout: محجوب/لا رد" if chain in BLOCKSCOUT else None,
+                f"RPC: {rpc_err}" if rpc_err else ("RPC: لا رد" if self.rpc and chain in RPC_URLS else None)) if x]
+        return r
+
+    def _wallet(self, chain: str, addr: str, since_ts: Optional[float] = None, now: Optional[float] = None):
         if self.eth and chain in EVM_CHAIN_IDS_FREE:
             r = self.eth.token_transfers(EVM_CHAIN_IDS[chain], address=addr)
             if r is not None:
@@ -1816,39 +1843,47 @@ def _cut(t, n: int = 92) -> str:
 
 
 def format_signal_compact(cand, score: float, plan: dict, tz: str, extra: Optional[dict] = None) -> str:
-    """تنبيه مختصر وأنيق: الدخول والوقف والأهداف أولاً، ثم 3 أسباب، ثم سطر أرقام وتفسير."""
+    """تنبيه مختصر وأنيق بالعربية والإنجليزية: الفئة، منطقة الدخول، الأهداف، الوقف، ثم الأسباب والأرقام."""
     extra = extra or {}
     c, e = cand.coin, html.escape
     st = extra.get("state")
-    L = [f"🟢 <b>#{e(c.symbol)}</b> · {e(c.name[:24])}   🔥<b>{score:.0f}</b>", LINE_S,
+    tier = extra.get("tier", "A")
+    tag = {"A": "🟢 STRONG · قوية", "B": "🟡 EARLY · مبكرة (نصف حجم)"}.get(tier, "🟢 SIGNAL")
+    lo, hi = plan.get("entry", (c.price, c.price))
+    L = [f"{tag}", f"<b>#{e(c.symbol)}</b> · {e(c.name[:24])}   🔥<b>{score:.0f}</b>", LINE_S,
          f"🧭 {e(cand.sectors[0] if cand.sectors else '—')}" + (f" · {STATE_EMO.get(st, '')} {STATE_AR.get(st, '')}" if st else ""),
-         f"💵 <code>${fmt_price(c.price)}</code>   🛑 <code>${fmt_price(plan['stop'])}</code> <b>−{plan['stop_pct']:.1f}%</b>",
-         "🎯 " + " · ".join(f"T{t['k']} <code>${fmt_price(t['price'])}</code> <b>+{t['pct']:.0f}%</b>" for t in plan["targets"][:3]),
-         "⚖️ عائد/مخاطرة " + " · ".join(f"1:{r:.1f}" for r in plan["rr"][:3]), "", "📌 <b>السبب</b>"]
+         "",
+         f"📍 <b>ENTRY · الدخول</b>  <code>${fmt_price(lo)}</code> – <code>${fmt_price(hi)}</code>",
+         "🎯 <b>TARGETS · الأهداف</b>",
+         "   " + " · ".join(f"T{t['k']} <code>${fmt_price(t['price'])}</code> <b>+{t['pct']:.0f}%</b>" for t in plan["targets"][:3]),
+         f"🛑 <b>STOP · الوقف</b>  <code>${fmt_price(plan['stop'])}</code> <b>−{plan['stop_pct']:.1f}%</b>   ⚖️ " + " · ".join(f"1:{r:.1f}" for r in plan["rr"][:3]),
+         "", "📌 <b>WHY · السبب</b>"]
     L += [f"• {e(_cut(t))}" for _, t in sorted(cand.reasons, key=lambda r: r[0])[:3]]
-    mk = [f"24س {fmt_pct(c.ch24h)}"]
+    mk = [f"24h {fmt_pct(c.ch24h)}"]
     if extra.get("xratio"):
-        mk.append(f"حجم ×{extra['xratio']:.1f}")
+        mk.append(f"Vol ×{extra['xratio']:.1f}")
     dex = cand.meta.get("dex")
     if dex:
-        mk.append(f"سيولة {fmt_usd(dex['liq'])}")
+        mk.append(f"Liq {fmt_usd(dex['liq'])}")
     ws = extra.get("whale_score")
     if ws and (ws["usd"] or ws["wallets"]):
         mk.append(f"🐋 {ws['score']:.0f}")
     if extra.get("quality"):
         mk.append(f"💧 {extra['quality']['score']:.0f}")
     if extra.get("manip") and extra["manip"]["risk"] >= 20:
-        mk.append(f"⚠️ تلاعب {extra['manip']['risk']}")
+        mk.append(f"⚠️ {extra['manip']['risk']}")
     L += ["", "📊 " + " · ".join(mk)]
     walls = []
     if plan["walls_up"]:
         w = plan["walls_up"][0]
-        walls.append(f"🧱 بيع ${fmt_price(w['price'])} (~{fmt_usd(w['usd'])})")
+        walls.append(f"🧱 Sell wall ${fmt_price(w['price'])} (~{fmt_usd(w['usd'])})")
     if plan["walls_dn"]:
         w = plan["walls_dn"][0]
-        walls.append(f"🛡 شراء ${fmt_price(w['price'])} (~{fmt_usd(w['usd'])})")
+        walls.append(f"🛡 Buy wall ${fmt_price(w['price'])}")
     if walls:
         L.append(" · ".join(walls))
+    if extra.get("evidence") and tier == "B":
+        L.append("✔ " + e(" · ".join(extra["evidence"][:4])))
     at = extra.get("attrib")
     if at and (at["pos"] or at["neg"]):
         pos = " · ".join(f"{p:+.0f} {e(n)}" for n, p in at["pos"][:3])
@@ -1856,7 +1891,7 @@ def format_signal_compact(cand, score: float, plan: dict, tz: str, extra: Option
         L.append("📐 " + pos + (f"  │  {neg}" if neg else ""))
     pr = extra.get("prob")
     if pr:
-        L.append(f"📈 احتمال النجاح ≈{pr['p'] * 100:.0f}% ({pr['n']} صفقة مماثلة)")
+        L.append(f"📈 Win ≈{pr['p'] * 100:.0f}% ({pr['n']} similar)")
     if extra.get("llm"):
         L.append(f"🤖 {e(_cut(extra['llm'], 100))}")
     g = extra.get("glob") or {}
@@ -1865,7 +1900,7 @@ def format_signal_compact(cand, score: float, plan: dict, tz: str, extra: Option
         foot = f"🌍 {g['score']:.0f}{ {'ENTERING': '↑', 'EXITING': '↓'}.get(g.get('state'), '') } · " + foot
     link = safe_url(cand.meta.get("url"))
     if link:
-        foot += f" · <a href=\"{e(link, quote=True)}\">الرسم</a>"
+        foot += f" · <a href=\"{e(link, quote=True)}\">Chart</a>"
     tail = "\n".join(["", foot, "<i>⚠️ ليست نصيحة مالية — التزم بالوقف</i>"])
     return safe_join(L, 3900 - len(tail) - 2) + "\n" + tail
 
@@ -3140,7 +3175,8 @@ def run_backtest(cfg, cg, ex, say=print) -> dict:
             curves = cf[ev[:, None] + 1 + hs[None, :]] - cf[ev + 1][:, None]
             base = (cf[allt[:, None] + 1 + hs[None, :]] - cf[allt + 1][:, None]).mean(axis=0)
             excess = curves.mean(axis=0) - base
-            hb = int(np.argmax(excess[1:])) + 2
+            mx = float(np.max(excess[1:]))
+            hb = next((h for h in range(2, HZ + 1) if excess[h - 1] >= 0.8 * mx), 2) if mx > 0 else 2
             ex = float(excess[hb - 1])
             hit = float(np.mean(curves[:, hb - 1] > base[hb - 1]))
             if hit >= 0.6 and ex * 100.0 >= 0.8:
@@ -3374,6 +3410,7 @@ class Engine:
         self.byid: dict = {}
         self.protocols: dict = {}
         self.proto_rows: list = []
+        self.ideas: list = []
         self.glob: dict = {}
         self.chain_scores: dict = {}
         self.chainflow: dict = {}
@@ -4076,17 +4113,40 @@ class Engine:
         self.summary["near_miss"] = [(round(s, 1), c.coin.symbol, sorted(c.kinds)) for s, c in scored[:6]]
         self.summary["threshold"] = round(threshold, 1)
 
-        sent = 0
+        flex_floor = min(float(self.cfg.get("run.flex_score")), threshold - 8.0)
+        need = int(self.cfg.get("run.flex_evidence"))
+        quota = {"A": int(self.cfg.get("run.max_alerts_per_run")), "B": int(self.cfg.get("run.max_flex_per_run")),
+                 "W": int(self.cfg.get("run.max_watch"))}
+        opened = {"A": 0, "B": 0, "W": 0}
         judged = 0
+        report_due = self._report_due(now)
+        self.ideas = []
         for s, c in scored:
-            if s < threshold or sent >= int(self.cfg.get("run.max_alerts_per_run")):
+            ev = self._evidence(c)
+            c.meta["evidence"] = ev
+            gate = c.meta.get("gate", "strict")
+            state = c.meta.get("state")
+            if s >= threshold and gate == "strict":
+                tier = "A"
+            elif ((s >= flex_floor and len(ev) >= need) or (s >= threshold and gate == "flex")) and state != "MARKUP":
+                tier = "B"
+            elif s >= float(self.cfg.get("run.watch_floor")):
+                tier = "W"
+            else:
                 continue
+            if opened[tier] >= quota[tier]:
+                if tier == "A" and opened["B"] < quota["B"] and len(ev) >= need:
+                    tier = "B"  # فائض الفئة A يهبط للمرنة بدل أن يضيع
+                else:
+                    continue
+            if tier == "W" and not report_due:
+                continue  # المراقبة تظهر في التقرير الدوري فقط
             plan = self._stage("plan", lambda c=c: self._plan(c, now))
             if not plan:
                 continue
             extra = {"xratio": self.vr(c.coin) if c.coin.live else None, "history": c.meta.get("history"),
-                     "news": c.meta.get("news"), **self._explain(c, s)}
-            if self.s.judge and judged < int(self.cfg.get("context.llm.max_calls_per_run")):
+                     "news": c.meta.get("news"), "tier": tier, "evidence": ev, **self._explain(c, s)}
+            if tier != "W" and self.s.judge and judged < int(self.cfg.get("context.llm.max_calls_per_run")):
                 judged += 1
                 verdict = self._stage("llm", lambda c=c, s=s, plan=plan: self.s.judge.review(self._llm_summary(c, s, plan)))
                 if verdict:
@@ -4095,14 +4155,22 @@ class Engine:
                         continue
                     s += 4.0 if verdict["verdict"] == "go" else -8.0
                     extra["llm"] = f"{verdict['note']} ({verdict['verdict']}، ثقة {verdict['confidence']:.0f}%)"
-                    if s < threshold:
+                    if s < (threshold if tier == "A" else flex_floor):
                         continue
-            fmt = format_signal if str(self.cfg.get("run.message_style", "compact")) == "full" else format_signal_compact
-            text = fmt(c, s, plan, self.cfg.get("run.timezone"), extra)
-            if self._send(text):
-                self._register(c, s, plan, now)
-                self.summary["signals"].append((round(s, 1), c.coin.symbol))
-                sent += 1
+            idea = {"tier": tier, "score": s, "cand": c, "plan": plan, "extra": extra, "opened": False}
+            if tier in ("A", "B"):
+                fmt = format_signal if str(self.cfg.get("run.message_style", "compact")) == "full" else format_signal_compact
+                if self._send(fmt(c, s, plan, self.cfg.get("run.timezone"), extra)):
+                    self._register(c, s, plan, now, tier)
+                    self.summary["signals"].append((round(s, 1), c.coin.symbol, tier))
+                    idea["opened"] = True
+                    opened[tier] += 1
+                else:
+                    continue
+            else:
+                opened["W"] += 1
+            self.ideas.append(idea)
+        self.summary["ideas"] = [(i["tier"], round(i["score"], 1), i["cand"].coin.symbol, i["opened"]) for i in self.ideas]
 
         self._heartbeat(now, stats)
         self._report_errors(now)
@@ -4186,6 +4254,7 @@ class Engine:
         c.features.setdefault("accum", None)
 
     def _passes_gates(self, c: Candidate, now: float) -> bool:
+        """بوابتان: صارمة (قبل الانفجار) ومرنة (لحاق بالسيولة مبكراً). الأولى تمنح فئة A والثانية فئة B."""
         g = self.cfg.get("gates")
         coin = c.coin
         if coin.mcap and coin.mcap > self.cfg.get("universe.max_market_cap"):
@@ -4193,14 +4262,38 @@ class Engine:
         if not coin.live and coin.age_h > 3.0 and not c.meta.get("dex") and not c.meta.get("whale_only"):
             c.meta["stale"] = True  # بيانات قديمة غير مؤكدة لحظياً: لا نخاطر بها
             return False
-        if coin.ch24h is not None and coin.ch24h > g["max_coin_24h"]:
+        ch24, ch1 = coin.ch24h, coin.ch1h
+        if not ((ch24 is None or ch24 <= g["flex_max_24h"]) and (ch1 is None or ch1 <= g["flex_max_1h"])):
             return False
-        if coin.ch1h is not None and coin.ch1h > g["max_coin_1h"]:
-            return False
+        strict = (ch24 is None or ch24 <= g["max_coin_24h"]) and (ch1 is None or ch1 <= g["max_coin_1h"])
+        c.meta["gate"] = "strict" if strict else "flex"
         cd = self.state.data["cooldown"].get(coin.id)
         if cd and now - cd < float(self.cfg.get("run.cooldown_hours")) * 3600:
             return False
-        return not any(s["coin_id"] == coin.id for s in self.state.data["open"])
+        return not any(p["coin_id"] == coin.id for p in self.state.data["open"])
+
+    def _evidence(self, c: Candidate) -> list:
+        """أدلة سيولة مستقلة تبرّر الدخول المبكر (الفئة B): كل دليل يُحسب مرة واحدة."""
+        f, ev = c.features, []
+        stage = (self.stats.get(c.meta.get("sector_key") or "") or {}).get("stage")
+        if (f.get("sector") or 0) >= 0.3 and (f.get("breadth") or 0) >= 0.45 and stage in (None, "leaders", "broadening", "running"):
+            ev.append("قطاع ساخن")
+        if (f.get("chain") or 0) >= 0.6 or "chainsector" in c.kinds:
+            ev.append("شبكة قوية")
+        r = self._vr_cache.get(c.coin.id)
+        if (r or 0) >= 1.5 or (f.get("vol") or 0) >= 0.5:
+            ev.append("حجم مرتفع")
+        if (f.get("whale") or 0) >= 0.3:
+            ev.append("حيتان")
+        if "rotation" in c.kinds:
+            ev.append("انتقال متوقع")
+        if (f.get("accum") or 0) >= 0.4 or c.meta.get("state") == "SEEDING":
+            ev.append("تجميع صامت")
+        if (f.get("dex") or 0) >= 0.6:
+            ev.append("ضغط شراء")
+        if (f.get("stable") or 0) >= 0.5:
+            ev.append("تدفق مستقرات")
+        return ev
 
     def _identify_dex(self, coin: Coin) -> Optional[dict]:
         dx = self.cfg.get("dex")
@@ -4307,6 +4400,8 @@ class Engine:
         dv = c.meta.get("daily_vol") or float(rc["default_daily_vol"])
         plan = build_plan(coin.price, coin.spark, dv, c.meta.get("gap_pct"), flow, book, dex.get("liq", 0.0), wall_usd,
                           tc, rc, self.K.mfe())
+        lo = max(plan["stop"] * 1.01, coin.price * (1 - min(0.35 * plan["stop_pct"], 3.0) / 100.0))
+        plan["entry"] = (lo, coin.price * 1.003)
         c.meta["plan"] = plan
         if dex or book:
             c.meta["quality"] = liquidity_quality(book, dex or None, int(dex.get("pools", 1)) if dex else 0, coin.mcap)
@@ -4342,7 +4437,7 @@ class Engine:
             "stop_pct": round(plan["stop_pct"], 1), "news": c.meta.get("news") or [],
             "crowded": bool(c.meta.get("crowded"))}, ensure_ascii=False)
 
-    def _register(self, c: Candidate, score: float, plan: dict, now: float) -> None:
+    def _register(self, c: Candidate, score: float, plan: dict, now: float, tier: str = "A") -> None:
         d = self.state.data
         d["seq"] += 1
         dex = c.meta.get("dex") or {}
@@ -4354,6 +4449,7 @@ class Engine:
                         for t in plan["targets"]],
             "stop": plan["stop"], "stop_cur": plan["stop"], "stop_pct": plan["stop_pct"], "hit": 0,
             "hi": c.coin.price, "lo": c.coin.price, "src": c.src, "miss": 0, "warned": 0,
+            "tier": tier, "size": 1.0 if tier == "A" else 0.5, "evidence": c.meta.get("evidence", []),
             "sector_key": c.meta.get("sector_key"), "heat0": c.meta.get("heat0"), "chain": c.meta.get("chain"),
             "contract": ({"chain": dex["chain"], "addr": dex["addr"], "pair": dex.get("pair", "")} if dex else None),
         })
@@ -4539,41 +4635,102 @@ class Engine:
                     left -= 1
 
     # ------------------------------------------------------------------ نبضة الحياة وتقرير الأخطاء
-    def _heartbeat(self, now: float, stats: dict) -> None:
-        """ملخص دوري موجز (كل run.heartbeat_hours): يثبت أن الرادار حيّ ويُظهر أقرب المرشحين وسبب غياب الإشارات."""
+    def _report_due(self, now: float) -> bool:
         hrs = float(self.cfg.get("run.heartbeat_hours"))
-        meta = self.state.data["meta"]
-        if hrs <= 0 or not stats or now - meta.get("last_heartbeat", 0) < hrs * 3600:
-            return
+        return hrs > 0 and bool(self.stats) and now - self.state.data["meta"].get("last_heartbeat", 0) >= hrs * 3600
+
+    def _opinion(self) -> list:
+        """رأي الرادار: أين تتجه السيولة ولماذا، وماذا يفعل المتداول (قواعد صريحة، لا تخمين)."""
         e = html.escape
-        top = sorted(stats.values(), key=lambda x: x["heat"], reverse=True)[:3]
-        wr, n = self.brain.win_rate()
-        L = ["📡 <b>رادار السيولة · ملخص</b>", LINE_S]
         g = self.glob or {}
-        if g.get("score") is not None:
-            L.append(f"🌍 السيولة العالمية <b>{g['score']:.0f}/100</b> {({'ENTERING': 'تدخل ↑', 'EXITING': 'تخرج ↓', 'NEUTRAL': 'محايدة'}).get(g['state'], '')}")
-        L.append("🔥 " + " · ".join(f"{e(x['label'].split('·')[0].strip())} {x['heat']:+.1f}%" for x in top))
-        nm = self.summary.get("near_miss", [])[:3]
-        if nm:
-            L.append("🔭 أقرب المرشحين: " + " · ".join(f"{e(sym)} {sc:.0f}" for sc, sym, _ in nm) + f"  (الحد {self.summary.get('threshold')})")
+        sc = g.get("score")
+        if sc is None:
+            bias, face = "UNKNOWN", "⚪"
         else:
-            L.append("🔭 لا مرشحين قريبين الآن")
+            bias, face = (("RISK-ON", "🟢") if sc >= 62 else (("RISK-OFF", "🔴") if sc <= 42 else ("NEUTRAL", "🟡")))
+        L = [f"🌍 Global Liquidity · السيولة العالمية: <b>{sc:.0f}/100</b> {face} {bias}" if sc is not None
+             else "🌍 Global Liquidity · السيولة العالمية: غير متاحة الآن ⚪"]
+        heads = []
+        if self.deploy:
+            d0 = self.deploy[0]
+            pct = d0.get("of_global") if d0.get("of_global") is not None else d0["share"]
+            heads.append(f"💵 الدولار الجديد → <b>{e(str(d0['chain']))}</b> ({pct * 100:.0f}%)")
+        if self.chainflow:
+            tc = max(self.chainflow.values(), key=lambda x: x["score"])
+            heads.append(f"⛓ أقوى شبكة: <b>{e(tc['label'])}</b> ({tc['score']:.0f}/100)")
+        hot = sorted((x for x in self.stats.values() if x["heat"] > 0), key=lambda x: -x["heat"])[:2]
+        stg = {"leaders": "قيادة", "broadening": "اتساع", "late": "متأخرة", "cooling": "تبريد", "running": "جارٍ", "quiet": "هادئ"}
+        if hot:
+            heads.append("🔥 " + " · ".join(f"<b>{e(x['label'].split('·')[0].strip())}</b> {x['heat']:+.1f}% ({stg.get(x.get('stage'), '')})" for x in hot))
+        cs = [r for r in self.chsec if r["score"] is not None and r["score"] >= 60][:1]
+        if cs:
+            heads.append(f"🏗 {e(cs[0]['chain'])}·{e(cs[0]['cat'])} TVL {cs[0]['g7']:+.0f}%")
+        L.append("💧 Liquidity flows to · السيولة تتجه إلى:" if heads else "💧 لا اتجاه واضح للسيولة الآن")
+        L += [f"   {h}" for h in heads]
         rot = self.summary.get("rotation") or []
         if rot:
-            L.append("🔄 انتقال متوقع: " + " · ".join(f"{e(str(a).replace('native:', ''))}→{e(str(b))}" for a, b, *_ in rot[:3]))
+            b, conf = rot[0][1], rot[0][2]
+            lab = self.stats.get(b, {}).get("label", b).split("·")[0].strip()
+            L.append(f"🔭 Next · التالي المتوقع: <b>{e(lab)}</b> (ثقة {conf * 100:.0f}%)")
+        if bias == "RISK-OFF":
+            L.append("💡 الخلاصة: السيولة العامة ضعيفة → صفقات صغيرة ومبكرة فقط، لا تطارد الصعود.")
+        elif bias == "RISK-ON":
+            L.append("💡 الخلاصة: بيئة داعمة → الأفضلية للقطاع الأسخن وللمتأخرات داخله.")
+        else:
+            L.append("💡 الخلاصة: بيئة محايدة → انتقائية، ركّز على القطاعات في مرحلة اتساع.")
+        return L
+
+    def _idea_lines(self, n: int, idea: dict) -> list:
+        e, c, p = html.escape, idea["cand"], idea["plan"]
+        tier = idea["tier"]
+        tag = {"A": "🟢 STRONG · قوية", "B": "🟡 EARLY · مبكرة (نصف حجم)", "W": "👀 WATCH · مراقبة"}[tier]
+        L = [f"{NUM[n]} {tag}  <b>#{e(c.coin.symbol)}</b> · {e(c.coin.name[:20])}  <i>({idea['score']:.0f}){' ✅ فُتحت' if idea['opened'] else ''}</i>"]
+        lo, hi = p.get("entry", (c.coin.price, c.coin.price))
+        if tier == "W":
+            L.append(f"   📍 Trigger · شرط الدخول: فوق <code>${fmt_price(c.coin.price * 1.008)}</code> مع حجم داعم")
+        else:
+            L.append(f"   📍 Entry · الدخول: <code>${fmt_price(lo)}</code> – <code>${fmt_price(hi)}</code>")
+        L.append("   🎯 " + " · ".join(f"T{t['k']} <code>${fmt_price(t['price'])}</code> <b>+{t['pct']:.0f}%</b>" for t in p["targets"][:3]))
+        L.append(f"   🛑 Stop · الوقف: <code>${fmt_price(p['stop'])}</code> <b>−{p['stop_pct']:.1f}%</b>")
+        why = [t for _, t in sorted(c.reasons, key=lambda r: r[0])][:1]
+        if why:
+            L.append(f"   💬 {e(_cut(why[0], 80))}")
+        if idea["extra"].get("evidence"):
+            L.append("   ✔ " + e(" · ".join(idea["extra"]["evidence"][:4])))
+        return L
+
+    def _heartbeat(self, now: float, stats: dict) -> None:
+        """التقرير الدوري: ① القطاعات المفحوصة ② رأي الرادار ③ الصفقات المقترحة (دخول/أهداف/وقف)."""
+        if not self._report_due(now):
+            return
+        e = html.escape
+        meta = self.state.data["meta"]
+        wr, n = self.brain.win_rate()
+        ranked = sorted(stats.values(), key=lambda x: x["heat"], reverse=True)
+        L = ["📡 <b>RADAR REPORT · تقرير الرادار</b>", LINE_S, "",
+             f"🔎 <b>Sectors Scanned · القطاعات المفحوصة</b>  ({len(stats)}/{len(self.cfg.sectors)})"]
+        if ranked:
+            L.append("🔥 " + " · ".join(f"{e(x['label'].split('·')[0].strip())} {x['heat']:+.1f}%" for x in ranked[:4]))
+            cold = [x for x in ranked[::-1] if x["heat"] < 0 and x not in ranked[:4]][:2]
+            if cold:
+                L.append("🧊 " + " · ".join(f"{e(x['label'].split('·')[0].strip())} {x['heat']:+.1f}%" for x in cold))
         if self.chainflow:
-            tops = sorted(self.chainflow.values(), key=lambda x: -x["score"])[:3]
+            tops = sorted(self.chainflow.values(), key=lambda x: -x["score"])[:4]
             L.append("⛓ " + " · ".join(f"{e(t['label'])} {t['score']:.0f}" for t in tops))
-        if self.deploy:
-            L.append("💵 الدولار الجديد → " + " · ".join(f"{e(str(r['chain']))} {(r.get('of_global') if r.get('of_global') is not None else r['share']) * 100:.0f}%" for r in self.deploy[:3]))
-        hot = [r for r in self.chsec if r["score"] is not None and r["score"] >= 60][:2]
-        if hot:
-            L.append("🏗 " + " · ".join(f"{e(r['chain'])}·{e(r['cat'])} {r['g7']:+.0f}%" for r in hot))
+        L += ["", "🧠 <b>Radar View · رأي الرادار</b>"] + self._opinion()
+        L += ["", "📈 <b>Trade Ideas · صفقات مقترحة</b>"]
+        ideas = sorted(self.ideas, key=lambda i: (-{"A": 2, "B": 1, "W": 0}[i["tier"]], -i["score"]))[:4]
+        if ideas:
+            for k, idea in enumerate(ideas):
+                L += self._idea_lines(k, idea)
+        else:
+            near = self.summary.get("near_miss", [])[:3]
+            L.append("لا فرص كافية الآن" + (" — الأقرب: " + " · ".join(f"{e(sym)} {sc:.0f}" for sc, sym, _ in near) if near else ""))
         w = self.summary.get("wallets")
-        if w:
-            L.append(f"🐋 محافظ: {w['checked']} فُحصت" + (f" · {len(w['failed'])} تعذّرت" if w["failed"] else ""))
-        L.append(f"📈 مفتوحة {len(self.state.data['open'])} · مُقيَّمة {n}" + (f" · نجاح {wr * 100:.0f}%" if wr is not None else ""))
-        L.append(f"📶 {self.summary.get('live') or 'بدون أسعار لحظية'} · معرفة تاريخية {'✓' if self.K.ready else '✗'} · ⏱ {now_label(self.cfg.get('run.timezone'))}")
+        L += ["", f"📂 Open {len(self.state.data['open'])} · Closed {n}" + (f" · Win {wr * 100:.0f}%" if wr is not None else "")
+              + (f" · 🐋 {w['checked']} wallets" if w else ""),
+              f"📶 {self.summary.get('live') or 'no live prices'} · ⏱ {now_label(self.cfg.get('run.timezone'))}",
+              "<i>⚠️ ليست نصيحة مالية — التزم بالوقف وأدر المخاطر</i>"]
         if self._send(safe_join(L, 3900)):
             meta["last_heartbeat"] = now
 
@@ -4609,9 +4766,9 @@ class Engine:
 # ======================================================================
 REQUIRED_KEYS = {
     "run": ["min_score", "max_alerts_per_run", "cooldown_hours", "timezone", "heartbeat_hours", "notify_outcomes",
-            "notify_errors", "dex_confirm_top", "time_budget_sec"],
+            "notify_errors", "dex_confirm_top", "time_budget_sec", "flex_score", "flex_evidence", "max_flex_per_run", "watch_floor", "max_watch"],
     "universe": ["min_market_cap", "max_market_cap", "min_volume_24h", "per_page"],
-    "gates": ["max_coin_24h", "max_coin_1h"],
+    "gates": ["max_coin_24h", "max_coin_1h", "flex_max_24h", "flex_max_1h"],
     "live": ["enabled", "exchanges", "match_tolerance", "snapshot_hours", "klines_per_run"],
     "paprika": ["monthly_budget"],
     "macro": ["enabled", "refresh_minutes", "mint_alert_usd"],
@@ -5580,15 +5737,43 @@ def _t_compact_message(tmp):
                                  {"sym": "R3", "cat": "Lending", "chains": ["Solana"], "tvl": 4e7, "d1": 1.0, "d7": 24.0}]}
     eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True), proto=proto)
     eng.cfg.settings["run"]["message_style"] = "compact"
+    eng.cfg.settings["run"]["heartbeat_hours"] = 0
     s = eng.run()
-    msgs = [m for m in svc.notifier.sent if "#LAG" in m and "🎯" in m]
+    msgs = [m for m in svc.notifier.sent if "#LAG" in m and "ENTRY" in m]
     assert msgs, s["near_miss"]
     m = msgs[0]
-    assert len(m) < 1400 and m.count("\n") <= 22, (len(m), m.count("\n"))
-    for part in ("🛑", "T1", "⚖️", "📌", "📊", "📐", "🌍", "ليست نصيحة مالية"):
+    assert len(m) < 1500 and m.count("\n") <= 28, (len(m), m.count("\n"))
+    for part in ("STRONG", "ENTRY · الدخول", "TARGETS · الأهداف", "STOP · الوقف", "WHY · السبب", "⚖️", "📊", "📐", "🌍", "ليست نصيحة مالية"):
         assert part in m, part
-    assert m.count("<b>") == m.count("</b>") and m.count("<code>") == m.count("</code>")
-    assert "ضخ سيولة" not in m
+    assert m.count("<b>") == m.count("</b>") and m.count("<code>") == m.count("</code>") and "ضخ سيولة" not in m
+    assert state.data["open"][0]["tier"] == "A" and state.data["open"][0]["size"] == 1.0
+
+
+def _t_tiers_and_report(tmp):
+    """الرادار المرن: ما لا يبلغ الحد الصارم لكن عنده أدلة سيولة يُفتح كفئة B بنصف حجم، والتقرير يحوي القطاعات والرأي والصفقات."""
+    proto = {"map": {}, "rows": [{"sym": "LAG", "cat": "Lending", "chains": ["Solana"], "tvl": 5e7, "d1": 1.0, "d7": 30.0},
+                                 {"sym": "R3", "cat": "Lending", "chains": ["Solana"], "tvl": 4e7, "d1": 1.0, "d7": 24.0}]}
+    eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True), proto=proto)
+    eng.cfg.settings["run"].update(message_style="compact", min_score=90, heartbeat_hours=3, flex_score=30, flex_evidence=2)
+    s = eng.run()
+    assert state.data["open"], s["near_miss"]
+    pos = state.data["open"][0]
+    assert pos["tier"] == "B" and pos["size"] == 0.5 and len(pos["evidence"]) >= 2, pos
+    alert = [m for m in svc.notifier.sent if "EARLY" in m and "ENTRY" in m]
+    assert alert and "نصف حجم" in alert[0]
+    rep = [m for m in svc.notifier.sent if "RADAR REPORT" in m]
+    assert rep, "التقرير لم يُرسل"
+    r = rep[0]
+    for part in ("Sectors Scanned · القطاعات المفحوصة", "Radar View · رأي الرادار", "Trade Ideas · صفقات مقترحة", "Entry · الدخول",
+                 "Stop · الوقف", "Global Liquidity", "الخلاصة"):
+        assert part in r, part
+    assert r.index("Sectors Scanned") < r.index("Radar View") < r.index("Trade Ideas") and len(r) < 3900
+    eng.cfg.settings["run"].update(min_score=99, flex_score=95)  # لا أدلة كافية ولا درجة: لا فتح
+    eng2, svc2, st2, _ = _st_engine(tmp + "_n", macro=_FakeMacro(True), proto=proto)
+    eng2.cfg.settings["run"].update(min_score=99, flex_score=95, heartbeat_hours=3)
+    eng2.run()
+    assert not st2.data["open"]
+    assert [m for m in svc2.notifier.sent if "RADAR REPORT" in m]
 
 
 def _t_dry_run_isolated(tmp):
@@ -5604,7 +5789,7 @@ def _t_secrets_and_doctor():
                         "ETHERSCAN_API_KEY": "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "SOLANA_RPC_URL": "https://mainnet.helius-rpc.com/?api-key=xyz"})
     st = {r[1]: r[0] for r in rows}
     assert st["سر TELEGRAM_BOT_TOKEN"] == st["سر TELEGRAM_CHAT_ID"] == st["سر ETHERSCAN_API_KEY"] == st["سر SOLANA_RPC_URL"] == "ok"
-    assert st["سر COINGECKO_API_KEY"] == "warn"
+    assert st["سر COINGECKO_API_KEY"] == "info"
     assert "xyz" not in " ".join(r[2] for r in rows), "تسرّب سر في التقرير"
     bad = {r[1]: r for r in secret_rows({"TELEGRAM_BOT_TOKEN": "notatoken", "TELEGRAM_CHAT_ID": ""})}
     assert bad["سر TELEGRAM_BOT_TOKEN"][0] == "fail" and bad["سر TELEGRAM_CHAT_ID"][0] == "fail"
@@ -5677,11 +5862,11 @@ def _t_mint_and_digest(tmp):
     eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True))
     eng.cfg.settings["run"]["heartbeat_hours"] = 6
     eng.run()
-    d = [m for m in svc.notifier.sent if "ملخص" in m]
-    assert d and "الحد" in d[0] and "🔥" in d[0] and len(d[0]) < 1600, svc.notifier.sent[:2]
+    d = [m for m in svc.notifier.sent if "RADAR REPORT" in m]
+    assert d and "Radar View" in d[0] and len(d[0]) < 3900, svc.notifier.sent[:2]
     eng2 = Engine(eng.cfg, state, svc, now_fn=lambda: NOW0 + 600)
     eng2.run()
-    assert sum("ملخص" in m for m in svc.notifier.sent) == 1, "الملخص تكرر قبل 6 ساعات"
+    assert sum("RADAR REPORT" in m for m in svc.notifier.sent) == 1, "التقرير تكرر قبل 6 ساعات"
 
 
 def _t_telegram_fallback():
@@ -5720,7 +5905,7 @@ def run_offline_selftest(verbose: bool = True) -> tuple:
               ("التلاعب + جودة السيولة + Whale Score + الاحتمال", _t_risk_engines, False),
               ("محرك Lead-Lag (إصابة/وقت/ثقة)", _t_leadlag_backtest, False),
               ("المحركات الكلية داخل الخط الكامل + التفسير", _t_macro_pipeline, True),
-              ("التنبيه المختصر الأنيق", _t_compact_message, True), ("عزل الوضع التجريبي عن الحالة", _t_dry_run_isolated, True),
+              ("التنبيه المختصر الأنيق", _t_compact_message, True), ("الرادار المرن A/B/Watch + التقرير", _t_tiers_and_report, True), ("عزل الوضع التجريبي عن الحالة", _t_dry_run_isolated, True),
               ("الأسرار والتنظيف وأداة doctor", _t_secrets_and_doctor, False), ("بديل RPC لمحافظ EVM (بلا حجب)", _t_rpc_transfers, False),
               ("رسالة الضخ والملخص الدوري", _t_mint_and_digest, True), ("تيليجرام: رجوع لنص عادي عند رفض HTML", _t_telegram_fallback, False),
               ("توقع الانتقال داخل الخط الكامل بلا تكرار", _t_rotation_pipeline, True), ("التحصين الأمني (أسرار، HTML، XML)", _t_hardening, False)]
@@ -5871,7 +6056,7 @@ def make_services(cfg, http, dry_run: bool = False, notifier=None) -> Services:
     return Services(cg=make_market_provider(cfg, http),
                     llama=DefiLlama(http), dex=DexScreener(http),
                     ex=Exchanges(http, cfg.get("live.exchanges")) if cfg.get("live.enabled") else None,
-                    xfer=Transfers(eth, Blockscout(http), RpcTransfers(http)), eth=eth, sol=sol, news=News(http), judge=judge,
+                    xfer=Transfers(eth, Blockscout(http), RpcTransfers(http, {c: _clean_secret(os.environ.get(f"RPC_URL_{c.upper()}")) for c in RPC_URLS})), eth=eth, sol=sol, news=News(http), judge=judge,
                     notifier=notifier, know=Knowledge.load(), macro=Macro(http, env.get("GH_TOKEN")))
 
 
@@ -5922,7 +6107,7 @@ def cmd_run(args) -> int:
 
 
 def _print_live(rows: list) -> int:
-    icon = {"ok": "✅", "warn": "⚠️ ", "fail": "❌"}
+    icon = {"ok": "✅", "warn": "⚠️ ", "fail": "❌", "info": "ℹ️ "}
     for status, name, detail in rows:
         print(f"  {icon[status]} {name}" + (f" — {detail}" if detail else ""))
     return sum(1 for r in rows if r[0] == "fail")
@@ -6130,7 +6315,8 @@ def secret_rows(env: dict) -> list:
     for name, required, pat, hint in SECRET_RULES:
         v = env.get(name)
         if not v:
-            rows.append(("fail" if required else "warn", f"سر {name}", f"غير موجود في بيئة التشغيل. {hint}. {WHERE}"))
+            rows.append(("fail", f"سر {name}", f"غير موجود في بيئة التشغيل. {hint}. {WHERE}") if required
+                        else ("info", f"سر {name}", f"غير مفعّل (اختياري). {hint}"))
             continue
         shown = urlparse(v).netloc if name == "SOLANA_RPC_URL" else (f"{v[:3]}…{v[-2:]}" if len(v) > 10 else "***")
         ok = bool(re.fullmatch(pat, v))
@@ -6195,13 +6381,18 @@ def doctor_checks(cfg, http) -> list:
     wb = WhaleBot(cfg, svc.xfer, svc.sol, svc.dex, default_state())
     wb.wallets = wallets[:25]
     wb.scan_wallets(time.time())
+    why = ""
+    if wb.failed:
+        chains = sorted({f.split("@")[-1] for f in wb.failed if "@" in f})
+        why = " | ".join(f"{c}: {svc.xfer.why(c)}" for c in chains if c != "solana")
     rows.append(("ok" if wb.checked and not wb.failed else ("warn" if wb.checked else "fail"), "محافظ الحيتان",
-                 f"{wb.checked} فُحصت" + (f" · تعذّر: {', '.join(wb.failed[:6])}" if wb.failed else "")))
+                 f"{wb.checked} فُحصت" + (f" · تعذّر: {', '.join(wb.failed[:6])}" if wb.failed else "") + (f" ← السبب: {why}" if why else "")
+                 + (" ← الحل: عطّل المحفظة في config.yaml أو أضف سر RPC_URL_BASE (انظر README)" if wb.failed else "")))
     return rows
 
 
 def verdict(rows: list) -> tuple:
-    n = {"ok": 0, "warn": 0, "fail": 0}
+    n = {"ok": 0, "warn": 0, "fail": 0, "info": 0}
     for r in rows:
         n[r[0]] += 1
     return n
@@ -6257,7 +6448,7 @@ def cmd_doctor(args) -> int:
     print("\n═══ النتيجة ═══")
     n = verdict(rows)
     for status, name, detail in rows:
-        if status != "ok":
+        if status in ("warn", "fail"):
             print(f"  {'❌' if status == 'fail' else '⚠️ '} {name}: {detail}")
     ok_all = n["fail"] == 0
     print(f"\n  ✅ {n['ok']}   ⚠️ {n['warn']}   ❌ {n['fail']}   ·  {time.time() - t0:.0f} ثانية")
@@ -6266,8 +6457,11 @@ def cmd_doctor(args) -> int:
     token, chat = cfg.env.get("TELEGRAM_BOT_TOKEN"), cfg.env.get("TELEGRAM_CHAT_ID")
     lines = ["🩺 <b>تقرير فحص الرادار</b>", LINE, f"✅ {n['ok']}   ⚠️ {n['warn']}   ❌ {n['fail']}"]
     for status, name, detail in rows:
-        if status != "ok":
+        if status in ("warn", "fail"):
             lines.append(f"{'❌' if status == 'fail' else '⚠️'} <b>{html.escape(name)}</b>: {html.escape(detail[:140])}")
+    opt = [name.replace("سر ", "") for status, name, _ in rows if status == "info"]
+    if opt:
+        lines.append("ℹ️ اختياري غير مفعّل: " + html.escape(", ".join(opt)))
     lines.append("\n" + ("🟢 جاهز للعمل" if ok_all else "🔴 أصلح البنود ❌ ثم أعد الفحص"))
     if cap.sent:
         lines.append(f"(التشغيلة التجريبية ولّدت {len(cap.sent)} رسالة محجوزة لم تُرسل)")
