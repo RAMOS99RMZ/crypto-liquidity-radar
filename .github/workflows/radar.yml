@@ -38,6 +38,8 @@ jobs:
       SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL || vars.SOLANA_RPC_URL }}
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY || vars.HELIUS_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      RPC_URL_BASE: ${{ secrets.RPC_URL_BASE || vars.RPC_URL_BASE }}     # اختياري: عقدة Base خاصة مجانية (Alchemy/dRPC)
+      RPC_URL_BSC: ${{ secrets.RPC_URL_BSC || vars.RPC_URL_BSC }}
       GH_TOKEN: ${{ github.token }}   # نشاط المطورين من GitHub (تلقائي، لا تضفه كسر)
     steps:
       - uses: actions/checkout@v4
