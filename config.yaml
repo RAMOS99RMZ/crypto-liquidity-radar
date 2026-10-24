@@ -49,6 +49,28 @@ dev_repos:
   cosmos: ["cosmos/cosmos-sdk"]
   mantle: ["mantlenetworkio/mantle-v2"]
 
+quant:                          # المحرك الكمي: تعلّم ذاتي من كل ملاحظة وصفقة (مخزّنة في SQLite)
+  shadow_top: 12                # أفضل N مرشحاً تُسجَّل كل تشغيلة كـ«ملاحظات ظل» لتتعلم مما لم يُفتح
+  shadow_cooldown_h: 6          # لا تُسجَّل نفس العملة مجدداً قبل هذه المدة
+  shadow_horizon_h: 36          # مهلة الحاجز الثلاثي (هدف/وقف/انتهاء)
+  shadow_weight: 0.3            # وزن عينات الظل في نموذج التعلّم مقابل الصفقات الفعلية
+  min_n: 6                      # أدنى عدد ملاحظات لبناء درس
+  min_total: 40                 # أدنى مجموع ملاحظات قبل تطبيق الدروس على الدرجة
+  shrink_k: 8                   # قوة انكماش بيزي نحو المتوسط العام
+  adj_gain: 40                  # تحويل فرق نسبة النجاح إلى نقاط
+  lesson_cap: 4                 # أقصى تعديل لدرس واحد
+  total_cap: 8                  # أقصى مجموع تعديلات الدروس
+  apply_adjustments: true
+  auto_thresholds: true         # معايرة min_score وflex_score ذاتياً من الملاحظات
+  calib_min: 60                 # أدنى ملاحظات للمعايرة
+  wallet_min_n: 4               # أدنى أحداث لضبط وزن المحفظة تلقائياً
+  report_hours: 168             # تقرير كمي أسبوعي إلى تيليجرام
+  retention_days: 30            # الاحتفاظ بتفاصيل المسح
+  obs_days: 120                 # الاحتفاظ بالملاحظات المُقيَّمة
+
+db:
+  path: .radar_state/radar.db   # قاعدة SQLite (تُحفظ مع الكاش، وتُنزَّل بنمط export_db)
+
 rotation:                       # توقع انتقال السيولة داخل القطاع وبين القطاعات
   enabled: true
   min_source_heat: 4.0          # أدنى حرارة للقطاع المصدر
