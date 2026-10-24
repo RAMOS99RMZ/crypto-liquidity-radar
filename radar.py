@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -1646,11 +1647,11 @@ class Brain:
         return 100.0 * p
 
     # ---- التعلّم
-    def learn(self, samples: list) -> int:
-        """samples = [(features, y)] حيث y=1 نجاح و0 فشل. يعيد عدد العينات المتعلَّمة."""
+    def learn(self, samples: list, weight: float = 1.0) -> int:
+        """samples = [(features, y)] حيث y=1 نجاح و0 فشل. weight < 1 لعينات الظل (مرشحون لم تُفتح صفقاتهم)."""
         if not samples:
             return 0
-        lr, l2 = float(self.lc["lr"]), float(self.lc["l2"])
+        lr, l2 = float(self.lc["lr"]) * weight, float(self.lc["l2"])
         for _ in range(3):
             for f, y in samples:
                 x = self._x(f)
@@ -1659,7 +1660,7 @@ class Brain:
                     reg = l2 * (self.m["theta"][k] - self.m["theta0"][k])  # شدّ نحو الأوزان الأولية
                     self.m["theta"][k] = max(-10.0, min(10.0, self.m["theta"][k] - lr * (g * x[k] + reg)))
                 self.m["bias"] = max(-10.0, min(10.0, self.m["bias"] - lr * g))
-        self.m["n"] += len(samples)
+        self.m["n"] += len(samples) * weight
         return len(samples)
 
     # ---- حد أدنى متكيّف مع نسبة النجاح الأخيرة
@@ -1873,6 +1874,8 @@ def format_signal_compact(cand, score: float, plan: dict, tz: str, extra: Option
     if extra.get("manip") and extra["manip"]["risk"] >= 20:
         mk.append(f"⚠️ {extra['manip']['risk']}")
     L += ["", "📊 " + " · ".join(mk)]
+    if extra.get("risk"):
+        L.append(f"💼 <b>Risk · المخاطرة</b> {extra['risk']}% من المحفظة")
     walls = []
     if plan["walls_up"]:
         w = plan["walls_up"][0]
@@ -2239,7 +2242,7 @@ SKIP_SYMBOLS = {
 
 
 class WhaleBot:
-    def __init__(self, cfg, xfer, sol, dex, state_data: dict, extra_wallets=None):
+    def __init__(self, cfg, xfer, sol, dex, state_data: dict, extra_wallets=None, wallet_mult: Optional[dict] = None):
         self.cfg = cfg
         self.w = cfg.get("whales")
         self.xfer = xfer
@@ -2253,9 +2256,11 @@ class WhaleBot:
         self.exchanges = {str(a).lower() for a in (wl.get("exchanges") or {}).values()}
         raw = [x for x in (wl.get("wallets") or []) if isinstance(x, dict) and x.get("address")] + list(extra_wallets or [])
         self.wallets = []
+        mult = wallet_mult or {}
         for x in raw:
             if valid_wallet(x):
-                self.wallets.append(x)
+                m = mult.get(str(x.get("label")), 1.0)  # وزن متعلَّم من أداء المحفظة الفعلي
+                self.wallets.append(dict(x, weight=min(1.0, float(x.get("weight", 1.0)) * m)) if m != 1.0 else x)
             else:
                 log.warning("محفظة بعنوان/شبكة غير صالحة تم تجاهلها: %s", x.get("label"))
 
@@ -3253,6 +3258,265 @@ def run_backtest(cfg, cg, ex, say=print) -> dict:
 
 
 # ======================================================================
+# quant
+# ======================================================================
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, ts REAL, n_sectors INT, n_cands INT, n_signals INT,
+    glob_score REAL, glob_state TEXT, live TEXT, threshold REAL, flex REAL, errors TEXT);
+CREATE TABLE IF NOT EXISTS sector_scans(run_id INT, ts REAL, sector TEXT, heat REAL, breadth REAL, stage TEXT,
+    att REAL, n INT, med24 REAL, large24 REAL, small24 REAL);
+CREATE INDEX IF NOT EXISTS ix_ss ON sector_scans(sector, ts);
+CREATE TABLE IF NOT EXISTS chain_scans(run_id INT, ts REAL, chain TEXT, score REAL, notes TEXT);
+CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY, run_id INT, ts REAL, coin_id TEXT, symbol TEXT,
+    sector TEXT, chain TEXT, kind TEXT, tier TEXT, state TEXT, regime TEXT, stage TEXT, score REAL, price REAL,
+    stop_pct REAL, tgt_pct REAL, features TEXT, evidence TEXT, opened INT, status TEXT, exit_ts REAL, ret REAL,
+    mfe REAL, mae REAL, r REAL, y INT, hi REAL, lo REAL);
+CREATE INDEX IF NOT EXISTS ix_obs ON observations(status, ts);
+CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY, ts_open REAL, ts_close REAL, symbol TEXT, coin_id TEXT,
+    tier TEXT, size REAL, score REAL, entry REAL, stop REAL, targets TEXT, kinds TEXT, sector TEXT, chain TEXT,
+    state TEXT, regime TEXT, evidence TEXT, hit INT, ret REAL, mfe REAL, mae REAL, reason TEXT, y INT, r REAL,
+    postmortem TEXT);
+CREATE TABLE IF NOT EXISTS wallet_events(id INTEGER PRIMARY KEY, ts REAL, wallet TEXT, chain TEXT, addr TEXT,
+    symbol TEXT, kind TEXT, usd REAL, price REAL, ret24 REAL, label INT);
+CREATE TABLE IF NOT EXISTS warnings(id INTEGER PRIMARY KEY, ts REAL, symbol TEXT, kind TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS rotations(id INTEGER PRIMARY KEY, ts REAL, src TEXT, dst TEXT, conf REAL, lag_h REAL,
+    origin TEXT, heat0 REAL, heat_after REAL, checked INT);
+CREATE TABLE IF NOT EXISTS lessons(dim TEXT, key TEXT, n REAL, wins REAL, exp_r REAL, adj REAL, ts REAL,
+    PRIMARY KEY(dim, key));
+"""
+
+
+class RadarDB:
+    """قاعدة SQLite تحفظ كل حركات الرادار: التشغيلات، مسح القطاعات والشبكات، المرشحين (ملاحظات الظل)، الصفقات،
+    أحداث المحافظ، التحذيرات، توقعات الانتقال، والدروس المتعلَّمة. ملف واحد قابل للتنزيل والاستعلام بـ SQL."""
+
+    def __init__(self, path: str = ":memory:"):
+        self.path = path
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.con = sqlite3.connect(path, timeout=20)
+        self.con.row_factory = sqlite3.Row
+        self.con.executescript(SCHEMA)
+
+    def x(self, sql: str, args=()):
+        return self.con.execute(sql, args)
+
+    def q(self, sql: str, args=()) -> list:
+        return [dict(r) for r in self.con.execute(sql, args).fetchall()]
+
+    def commit(self) -> None:
+        self.con.commit()
+
+    def close(self) -> None:
+        try:
+            self.con.commit()
+            self.con.close()
+        except sqlite3.Error:
+            pass
+
+    def prune(self, now: float, days: float = 30.0, obs_days: float = 120.0) -> None:
+        cut, ocut = now - days * 86400, now - obs_days * 86400
+        for t in ("sector_scans", "chain_scans", "runs", "warnings"):
+            self.x(f"DELETE FROM {t} WHERE ts < ?", (cut,))
+        self.x("DELETE FROM rotations WHERE ts < ? AND checked = 1", (cut,))
+        self.x("DELETE FROM wallet_events WHERE ts < ? AND label IS NOT NULL", (ocut,))
+        self.x("DELETE FROM observations WHERE ts < ? AND status != 'open'", (ocut,))
+        self.con.commit()
+
+    def counts(self) -> dict:
+        return {t: self.q(f"SELECT COUNT(*) c FROM {t}")[0]["c"] for t in
+                ("runs", "sector_scans", "observations", "trades", "wallet_events", "warnings", "rotations", "lessons")}
+
+
+def barrier_label(entry: float, price: float, hi: float, lo: float, stop_pct: float, tgt_pct: float, age_h: float,
+                  horizon_h: float, rr: float) -> Optional[dict]:
+    """وسم الحاجز الثلاثي (López de Prado): هدف قبل وقف قبل انتهاء المهلة. None = ما زالت مفتوحة."""
+    ret = (price / entry - 1.0) * 100.0
+    if ret >= tgt_pct:
+        return {"status": "win", "r": rr, "y": 1, "ret": ret}
+    if ret <= -stop_pct:
+        return {"status": "loss", "r": -1.0, "y": 0, "ret": ret}
+    if age_h >= horizon_h:
+        return {"status": "expired", "r": ret / stop_pct if stop_pct else 0.0, "y": 1 if ret >= 0.4 * tgt_pct else 0, "ret": ret}
+    return None
+
+
+def postmortem(pos: dict, ret: float, reason: str, age_h: float, glob_now: Optional[float], warned: bool) -> str:
+    """تشخيص آلي لسبب النجاح/الفشل (قواعد صريحة) يُحفظ مع الصفقة ويغذّي التعلم."""
+    mfe = (pos["hi"] / pos["entry"] - 1.0) * 100.0
+    t1 = pos["targets"][0]["pct"] if pos.get("targets") else 5.0
+    tags = []
+    if reason in ("target", "trail") or pos.get("hit", 0) >= 1:
+        tags.append(f"نجاح: بلغ T{pos.get('hit', 1)}" + (" وكل الأهداف" if reason == "target" else ""))
+    if reason == "stop" and age_h < 2.0:
+        tags.append("وقف سريع (<2س): دخول متأخر أو ضوضاء")
+    if reason == "stop" and mfe >= 0.7 * t1:
+        tags.append(f"قارب الهدف (+{mfe:.1f}%) ثم انعكس: فكّر بجني جزئي")
+    if pos.get("state0") in ("MARKUP", "IGNITION") and reason == "stop":
+        tags.append(f"دخل في حالة {pos['state0']} (متأخر في الموجة)")
+    g0 = pos.get("glob0")
+    if reason in ("stop", "expired") and g0 is not None and glob_now is not None and glob_now <= g0 - 10:
+        tags.append(f"تدهورت السيولة العالمية {g0:.0f}→{glob_now:.0f}")
+    if warned and reason in ("stop", "trail"):
+        tags.append("سبقه تحذير تصريف")
+    if reason == "expired" and not tags:
+        tags.append("انتهت المهلة بلا زخم: السيولة لم تصل")
+    return " | ".join(tags) or "بلا ملاحظة"
+
+
+class Quant:
+    """المحرك الكمي: يتعلم من كل ملاحظة وصفقة. يبني دروساً بإحصاء بيزي منكمش، ويعدّل الدرجة، ويعاير العتبات،
+    ويقيّم المحافظ والتوقعات، ويقترح حجم المخاطرة."""
+
+    DIMS = ("sector", "state", "regime", "stage", "kind", "chain", "evidence", "score_bucket")
+
+    def __init__(self, db: RadarDB, cfg):
+        self.db, self.cfg = db, cfg
+        self.qc = cfg.get("quant")
+        self.adj: dict = {}
+        self.n_labeled = 0
+        self.p_overall: Optional[float] = None
+
+    # ------------------------------------------------------------------ دروس
+    def refresh(self, now: float) -> None:
+        rows = self.db.q("SELECT sector,state,regime,stage,kind,chain,evidence,score,r,y FROM observations "
+                         "WHERE status IN ('win','loss','expired') ORDER BY ts DESC LIMIT 6000")
+        self.n_labeled = len(rows)
+        self.adj = {}
+        if not rows:
+            return
+        self.p_overall = (sum(r["y"] for r in rows) + 1.0) / (len(rows) + 2.0)
+        agg: dict = {}
+        for r in rows:
+            keys = [("sector", r["sector"]), ("state", r["state"]), ("regime", r["regime"]), ("stage", r["stage"]),
+                    ("kind", r["kind"]), ("chain", r["chain"]), ("score_bucket", f"{int((r['score'] or 0) // 10) * 10}")]
+            try:
+                keys += [("evidence", t) for t in json.loads(r["evidence"] or "[]")]
+            except ValueError:
+                pass
+            for dim, key in keys:
+                if key in (None, "", "None"):
+                    continue
+                a = agg.setdefault((dim, str(key)), [0, 0, 0.0])
+                a[0] += 1
+                a[1] += r["y"]
+                a[2] += r["r"] or 0.0
+        k, cap, min_n = float(self.qc["shrink_k"]), float(self.qc["lesson_cap"]), int(self.qc["min_n"])
+        out = []
+        for (dim, key), (n, w, sr) in agg.items():
+            p = (w + k * self.p_overall) / (n + k)
+            adj = max(-cap, min(cap, (p - self.p_overall) * float(self.qc["adj_gain"]))) if n >= min_n else 0.0
+            self.adj[(dim, key)] = (adj, n, w)
+            out.append((dim, key, n, w, sr / n, adj, now))
+        self.db.x("DELETE FROM lessons")
+        self.db.con.executemany("INSERT INTO lessons VALUES(?,?,?,?,?,?,?)", out)
+        self.db.commit()
+
+    def adjust(self, cand, regime: Optional[str], stage: Optional[str]) -> list:
+        """تعديلات الدرجة من الدروس (±cap لكل درس، ±qc.total_cap للمجموع). لا تُطبَّق قبل qc.min_total ملاحظة."""
+        if not self.qc["apply_adjustments"] or self.n_labeled < int(self.qc["min_total"]):
+            return []
+        meta = cand.meta
+        keys = [("sector", meta.get("sector_key")), ("state", meta.get("state")), ("regime", regime), ("stage", stage),
+                ("kind", primary_kind(cand.kinds)), ("chain", meta.get("chain"))]
+        ev = [("evidence", t) for t in meta.get("evidence", [])]
+        found = [(d, str(k)) for d, k in keys if k] + [(d, str(k)) for d, k in ev]
+        rows = [(d, k, *self.adj[(d, k)]) for d, k in found if (d, k) in self.adj and abs(self.adj[(d, k)][0]) >= 0.5]
+        if not rows:
+            return []
+        tot = max(-float(self.qc["total_cap"]), min(float(self.qc["total_cap"]), sum(r[2] for r in rows)))
+        top = sorted(rows, key=lambda r: -abs(r[2]))[:3]
+        label = " + ".join(f"{r[0]}={r[1]} ({r[4]}/{r[3]})" for r in top)
+        return [(f"درس: {label}", round(tot, 1))]
+
+    # ------------------------------------------------------------------ معايرة العتبات
+    def calibrate(self) -> Optional[dict]:
+        rows = self.db.q("SELECT score,r,y FROM observations WHERE status IN ('win','loss','expired') AND score IS NOT NULL")
+        if len(rows) < int(self.qc["calib_min"]):
+            return None
+        table = []
+        for t in range(15, 80, 5):
+            sel = [r for r in rows if r["score"] >= t]
+            if len(sel) >= 10:
+                table.append({"t": t, "n": len(sel), "win": sum(r["y"] for r in sel) / len(sel),
+                              "exp": sum(r["r"] for r in sel) / len(sel)})
+        flex = next((x["t"] for x in table if x["n"] >= 25 and x["exp"] >= 0.0), None)
+        strict = next((x["t"] for x in table if flex is not None and x["t"] >= flex + 8 and x["n"] >= 15 and x["exp"] >= 0.2), None)
+        res = {"table": table, "n": len(rows), "flex": None, "strict": None}
+        if flex is not None:
+            res["flex"] = float(max(25, min(50, flex)))
+        if strict is not None:
+            res["strict"] = float(max(40, min(70, strict)))
+        return res
+
+    # ------------------------------------------------------------------ محافظ ذكية
+    def wallet_mults(self) -> dict:
+        rows = self.db.q("SELECT wallet, COUNT(*) n, SUM(label) w FROM wallet_events WHERE label IS NOT NULL GROUP BY wallet")
+        out = {}
+        for r in rows:
+            if r["n"] >= int(self.qc["wallet_min_n"]):
+                p = (r["w"] + 1.5) / (r["n"] + 3.0)
+                out[r["wallet"]] = round(max(0.4, min(1.4, 0.4 + 1.2 * p)), 2)
+        return out
+
+    # ------------------------------------------------------------------ حجم المخاطرة (كيلي مخفَّف)
+    def risk_pct(self, tier: str, closed: list) -> float:
+        base = 1.0 if tier == "A" else 0.5
+        rows = [c for c in closed if c.get("y") in (0, 1) and c.get("ret") is not None]
+        if len(rows) < 20:
+            return base
+        wins = [c["ret"] for c in rows if c["y"] == 1]
+        loss = [abs(c["ret"]) for c in rows if c["y"] == 0] or [1.0]
+        p, b = len(wins) / len(rows), (sum(wins) / max(len(wins), 1)) / max(sum(loss) / len(loss), 0.5)
+        kelly = p - (1 - p) / b if b > 0 else 0.0
+        return round(max(0.25, min(1.5, kelly / 4.0 * 100.0)) * (1.0 if tier == "A" else 0.5), 2)
+
+    # ------------------------------------------------------------------ تقرير
+    def report(self) -> dict:
+        db = self.db
+        obs = db.q("SELECT COUNT(*) n, SUM(y) w, AVG(r) er FROM observations WHERE status IN ('win','loss','expired')")[0]
+        tr = db.q("SELECT COUNT(*) n, SUM(y) w, AVG(r) er FROM trades WHERE ts_close IS NOT NULL")[0]
+        ranked = sorted(((d, k, v[1], v[2], v[0]) for (d, k), v in self.adj.items() if v[1] >= int(self.qc["min_n"]) and d != "score_bucket"),
+                        key=lambda x: -(x[3] / x[2]) if x[2] else 0)
+        best = [x for x in ranked if x[3] / x[2] > (self.p_overall or 0.4)][:3]
+        worst = [x for x in ranked[::-1] if x[3] / x[2] < (self.p_overall or 0.4)][:3]
+        rot = db.q("SELECT COUNT(*) n, SUM(CASE WHEN heat_after - heat0 >= 1.5 THEN 1 ELSE 0 END) h FROM rotations WHERE checked = 1")[0]
+        wal = db.q("SELECT wallet, COUNT(*) n, SUM(label) w FROM wallet_events WHERE label IS NOT NULL GROUP BY wallet HAVING n >= 3 ORDER BY (w*1.0/n) DESC")
+        return {"obs": obs, "trades": tr, "best": best, "worst": worst, "rot": rot, "wallets": wal[:4],
+                "mults": self.wallet_mults(), "cal": self.calibrate(), "adj_n": sum(1 for v in self.adj.values() if abs(v[0]) >= 0.5),
+                "counts": db.counts()}
+
+
+def format_quant_report(rep: dict, tz: str) -> str:
+    e = html.escape
+    o, t = rep["obs"], rep["trades"]
+    L = ["🧬 <b>QUANT REPORT · تقرير المحرك الكمي</b>", LINE_S, ""]
+    n = o["n"] or 0
+    L.append(f"📚 <b>Learning set · مجموعة التعلم</b>: {n} ملاحظة" + (f" · نجاح {o['w'] / n * 100:.0f}% · توقع {o['er']:+.2f}R" if n else ""))
+    tn = t["n"] or 0
+    L.append(f"💼 صفقات مُغلقة: {tn}" + (f" · نجاح {t['w'] / tn * 100:.0f}% · {t['er']:+.2f}R" if tn else ""))
+    if rep["best"]:
+        L.append("🏆 " + " · ".join(f"{e(d)}={e(k)} {w / n_ * 100:.0f}% ({n_})" for d, k, n_, w, _ in rep["best"]))
+    if rep["worst"]:
+        L.append("⚠️ " + " · ".join(f"{e(d)}={e(k)} {w / n_ * 100:.0f}% ({n_})" for d, k, n_, w, _ in rep["worst"]))
+    cal = rep["cal"]
+    if cal and (cal["flex"] or cal["strict"]):
+        L.append(f"🎚 معايرة ذاتية: A≥{cal['strict'] or '—'} · B≥{cal['flex'] or '—'}  (من {cal['n']} ملاحظة)")
+    elif n:
+        L.append("🎚 المعايرة تنتظر المزيد من الملاحظات")
+    if rep["wallets"]:
+        L.append("🐋 " + " · ".join(f"{e(w['wallet'][:14])} {w['w'] / w['n'] * 100:.0f}% (n={w['n']})" for w in rep["wallets"]))
+    r = rep["rot"]
+    if r["n"]:
+        L.append(f"🔭 توقعات الانتقال: {r['h'] or 0}/{r['n']} صحيحة")
+    L.append(f"🧠 دروس مطبَّقة على الدرجة: {rep['adj_n']}")
+    c = rep["counts"]
+    L += ["", f"🗄 DB: {c['runs']} تشغيلة · {c['observations']} ملاحظة · {c['trades']} صفقة · {c['sector_scans']} مسح قطاع",
+          f"⏱ {now_label(tz)}", "<i>⚠️ تعلّم إحصائي من عينات محدودة — لا يضمن أداءً مستقبلياً</i>"]
+    return safe_join(L, 3900)
+
+
+# ======================================================================
 # engine
 # ======================================================================
 STABLE_SYMBOLS = {
@@ -3332,7 +3596,7 @@ def estimate_cg_usage(cfg, live_ok: bool) -> dict:
 class Services:
     """حاوية المزوّدين (تسهّل الاختبار بمزوّدين وهميين)."""
 
-    NAMES = ("cg", "llama", "dex", "ex", "xfer", "sol", "news", "judge", "notifier", "know", "eth", "macro")
+    NAMES = ("cg", "llama", "dex", "ex", "xfer", "sol", "news", "judge", "notifier", "know", "eth", "macro", "db")
 
     def __init__(self, **kw):
         for k in self.NAMES:
@@ -3391,11 +3655,16 @@ class Discovery:
                  "weight": float(self.c["weight"])} for a, r in good[: int(self.c["max_wallets"])]]
 
 
+def g_state(glob: Optional[dict]) -> Optional[str]:
+    return (glob or {}).get("state")
+
+
 class Engine:
     def __init__(self, cfg, state, svc, now_fn=time.time, dry_run: bool = False):
         self.cfg, self.state, self.s = cfg, state, svc
         self.now_fn, self.dry_run = now_fn, dry_run
         self.K = svc.know or Knowledge({})
+        self.db = svc.db
         self.summary: dict = {"sectors": {}, "signals": [], "near_miss": [], "closed": 0, "errors": [], "warnings": [],
                               "triggers": []}
         self._vr_cache: dict = {}
@@ -3411,6 +3680,8 @@ class Engine:
         self.protocols: dict = {}
         self.proto_rows: list = []
         self.ideas: list = []
+        self.quant = None
+        self.wallet_mult: dict = {}
         self.glob: dict = {}
         self.chain_scores: dict = {}
         self.chainflow: dict = {}
@@ -3444,7 +3715,162 @@ class Engine:
         return [c for c in coins
                 if c.mcap >= u["min_market_cap"] and c.volume >= u["min_volume_24h"] and not is_stable(c)]
 
+    # ------------------------------------------------------------------ قاعدة البيانات والمحرك الكمي
+    def _dbx(self, fn, *a):
+        """عمليات SQL لا تُسقط التشغيلة أبداً."""
+        if not self.db:
+            return None
+        try:
+            return fn(*a)
+        except Exception as exc:
+            log.warning("DB: %s", exc)
+            self.summary["errors"].append(f"db: {exc}")
+            return None
+
+    def _quant_start(self, now: float) -> None:
+        d = self.state.data
+        self.quant = Quant(self.db, self.cfg)
+        q = self.quant
+        q.refresh(now)
+        qc = self.cfg.get("quant")
+        if qc["auto_thresholds"]:
+            cal = q.calibrate()
+            if cal:
+                d["quant"] = {"cal": cal, "ts": now}
+            cal = (d.get("quant") or {}).get("cal")
+            if cal:
+                if cal.get("strict"):
+                    self.cfg.settings["run"]["min_score"] = cal["strict"]
+                if cal.get("flex"):
+                    self.cfg.settings["run"]["flex_score"] = cal["flex"]
+                log.info("معايرة ذاتية: A≥%s · B≥%s (من %d ملاحظة)", cal.get("strict"), cal.get("flex"), cal["n"])
+        self.wallet_mult = q.wallet_mults()
+        self._rot_eval(now)
+        if now - d["meta"].get("last_prune", 0) > 86400:
+            self.db.prune(now, float(qc["retention_days"]), float(qc["obs_days"]))
+            d["meta"]["last_prune"] = now
+
+    def _rot_eval(self, now: float) -> None:
+        for r in self.db.q("SELECT id, dst FROM rotations WHERE checked = 0 AND ts < ?", (now - 24 * 3600,)):
+            row = self.db.q("SELECT heat FROM sector_scans WHERE sector = ? ORDER BY ts DESC LIMIT 1", (r["dst"],))
+            self.db.x("UPDATE rotations SET heat_after = ?, checked = 1 WHERE id = ?", (row[0]["heat"] if row else None, r["id"]))
+        self.db.commit()
+
+    def _db_rotation(self, fc: dict, stats: dict, now: float) -> None:
+        b = fc["to"]
+        if self.db.q("SELECT 1 FROM rotations WHERE src = ? AND dst = ? AND ts > ?", (fc["from"], b, now - 12 * 3600)):
+            return
+        self.db.x("INSERT INTO rotations VALUES(NULL,?,?,?,?,?,?,?,NULL,0)",
+                  (now, fc["from"], b, fc["conf"], fc["lag_h"], fc["src"], stats.get(b, {}).get("heat")))
+
+    def _db_wallet_events(self, events: list, now: float) -> None:
+        for ev in events:
+            if ev["kind"] not in ("accumulation", "exchange_outflow"):
+                continue
+            if self.db.q("SELECT 1 FROM wallet_events WHERE wallet = ? AND addr = ? AND ts > ?", (ev["wallet"], ev["addr"], now - 6 * 3600)):
+                continue
+            self.db.x("INSERT INTO wallet_events VALUES(NULL,?,?,?,?,?,?,?,?,NULL,NULL)",
+                      (now, ev["wallet"], ev["chain"], ev["addr"], ev["symbol"], ev["kind"], ev["usd"], ev["info"]["price"]))
+        self.db.commit()
+
+    def _wallet_eval(self, now: float) -> None:
+        """تقييم أحداث المحافظ بعد ~24 ساعة: هل ارتفع السعر؟ هذا ما يضبط وزن كل محفظة تلقائياً."""
+        rows = self.db.q("SELECT id, chain, addr, price, ts FROM wallet_events WHERE label IS NULL AND ts < ? ORDER BY ts LIMIT 90",
+                         (now - 20 * 3600,))
+        by: dict = {}
+        for r in rows:
+            by.setdefault(r["chain"], []).append(r)
+        for chain, lst in list(by.items())[:3]:
+            info = best_by_address(self.s.dex.tokens(chain, sorted({r["addr"] for r in lst})[:30]))
+            for r in lst:
+                i = info.get(r["addr"])
+                if i and r["price"]:
+                    ret = (i["price"] / r["price"] - 1.0) * 100.0
+                    self.db.x("UPDATE wallet_events SET ret24 = ?, label = ? WHERE id = ?", (ret, 1 if ret >= 2.0 else 0, r["id"]))
+                elif now - r["ts"] > 72 * 3600:
+                    self.db.x("UPDATE wallet_events SET label = -1 WHERE id = ?", (r["id"],))
+        self.db.commit()
+
+    def _obs_update(self, now: float) -> None:
+        """يقيّم ملاحظات الظل (مرشحون لم تُفتح لهم صفقات) بالحاجز الثلاثي ويتعلم منها بوزن مخفّض."""
+        qc, rr = self.cfg.get("quant"), float(self.cfg.get("risk.rr"))
+        hz, samples = float(qc["shadow_horizon_h"]), []
+        for o in self.db.q("SELECT * FROM observations WHERE status = 'open'"):
+            age_h = (now - o["ts"]) / 3600.0
+            tk = self.tickers.get(o["symbol"]) if self.tickers else None
+            if not tk or not 0.6 <= tk["price"] / o["price"] <= 1.6:
+                if age_h > hz * 2:
+                    self.db.x("UPDATE observations SET status = 'void', exit_ts = ? WHERE id = ?", (now, o["id"]))
+                continue
+            p = tk["price"]
+            hi, lo = max(o["hi"] or o["price"], p), min(o["lo"] or o["price"], p)
+            lab = barrier_label(o["price"], p, hi, lo, o["stop_pct"], o["tgt_pct"], age_h, hz, rr)
+            if lab is None:
+                self.db.x("UPDATE observations SET hi = ?, lo = ? WHERE id = ?", (hi, lo, o["id"]))
+                continue
+            self.db.x("UPDATE observations SET status=?, exit_ts=?, ret=?, mfe=?, mae=?, r=?, y=?, hi=?, lo=? WHERE id=?",
+                      (lab["status"], now, lab["ret"], (hi / o["price"] - 1) * 100, (lo / o["price"] - 1) * 100, lab["r"], lab["y"], hi, lo, o["id"]))
+            if not o["opened"]:
+                try:
+                    samples.append((json.loads(o["features"]), lab["y"]))
+                except ValueError:
+                    pass
+        self.db.commit()
+        if samples:
+            Brain(self.cfg, self.state.data).learn(samples, weight=float(qc["shadow_weight"]))
+            log.info("تعلّم النموذج من %d ملاحظة ظل", len(samples))
+
+    def _db_snapshot(self, now: float, scored: list) -> None:
+        db, qc = self.db, self.cfg.get("quant")
+        g = self.glob or {}
+        rid = db.x("INSERT INTO runs VALUES(NULL,?,?,?,?,?,?,?,?,?,?)",
+                   (now, len(self.stats), len(scored), len(self.summary["signals"]), g.get("score"), g.get("state"),
+                    self.summary.get("live"), self.summary.get("threshold"), float(self.cfg.get("run.flex_score")),
+                    "; ".join(self.summary["errors"])[:300])).lastrowid
+        db.con.executemany("INSERT INTO sector_scans VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           [(rid, now, k, v["heat"], v["breadth"], v.get("stage"), v.get("att_ratio"), v["n"], v["median_24h"],
+                             v.get("large24"), v.get("small24")) for k, v in self.stats.items()])
+        db.con.executemany("INSERT INTO chain_scans VALUES(?,?,?,?,?)",
+                           [(rid, now, k, v["score"], "; ".join(v["notes"][:4])) for k, v in self.chainflow.items()])
+        opened = {x[1] for x in self.summary["signals"]}
+        recent = {r["coin_id"] for r in db.q("SELECT coin_id FROM observations WHERE ts > ?", (now - float(qc["shadow_cooldown_h"]) * 3600,))}
+        rc = self.cfg.get("risk")
+        for s_, c in scored[: int(qc["shadow_top"])]:
+            if c.coin.id in recent and c.coin.symbol not in opened:
+                continue
+            dv = c.meta.get("daily_vol") or rc["default_daily_vol"]
+            stop = clip(1.2 * dv, float(rc["stop_min"]), float(rc["stop_max"]))
+            st = self.stats.get(c.meta.get("sector_key") or "") or {}
+            db.x("INSERT INTO observations VALUES(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL,NULL,NULL,?,?)",
+                 (rid, now, c.coin.id, c.coin.symbol, c.meta.get("sector_key") or (c.sectors[0] if c.sectors else None),
+                  c.meta.get("chain"), primary_kind(c.kinds), c.meta.get("tier"), c.meta.get("state"), g.get("state"),
+                  st.get("stage"), s_, c.coin.price, stop, stop * float(rc["rr"]),
+                  json.dumps({k: (round(v, 3) if v is not None else None) for k, v in c.features.items()}),
+                  json.dumps(c.meta.get("evidence", []), ensure_ascii=False), 1 if c.coin.symbol in opened else 0,
+                  c.coin.price, c.coin.price))
+        db.commit()
+
+    def _db_trade_open(self, pos: dict, c: Candidate) -> Optional[int]:
+        g = self.glob or {}
+        return self.db.x("INSERT INTO trades(ts_open, symbol, coin_id, tier, size, score, entry, stop, targets, kinds, sector, chain,"
+                         " state, regime, evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (pos["ts"], pos["symbol"], pos["coin_id"], pos["tier"], pos["size"], pos["score"], pos["entry"], pos["stop"],
+                          json.dumps([t["price"] for t in pos["targets"]]), ",".join(pos["kinds"]),
+                          pos.get("sector_key") or (pos["sectors"][0] if pos["sectors"] else None), pos.get("chain"),
+                          c.meta.get("state"), g.get("state"), json.dumps(pos.get("evidence", []), ensure_ascii=False))).lastrowid
+
+    def _db_trade_close(self, pos: dict, rec: dict, now: float) -> None:
+        if pos.get("db"):
+            r = rec["ret"] / pos["stop_pct"] if pos.get("stop_pct") else 0.0
+            self.db.x("UPDATE trades SET ts_close=?, hit=?, ret=?, mfe=?, mae=?, reason=?, y=?, r=?, postmortem=? WHERE id=?",
+                      (now, rec["hit"], rec["ret"], rec["mfe"], rec["mae"], rec["reason"], rec["y"], r, rec.get("pm"), pos["db"]))
+            self.db.commit()
+
     def _send(self, text: str) -> bool:
+        if self.db and text.startswith("🔴"):  # التحذيرات تُسجَّل في قاعدة البيانات
+            m = re.search(r"#([A-Za-z0-9_$.-]+)", text)
+            self._dbx(lambda: self.db.x("INSERT INTO warnings VALUES(NULL,?,?,?,?)", (self.now_fn(), m.group(1) if m else "?",
+                                                                                       text.split("\n")[0][:60], text[:400])))
         try:
             return bool(self.s.notifier.send(text))
         except Exception as exc:
@@ -3760,6 +4186,7 @@ class Engine:
                 nh.append({"sym": sym, "ch24": tk["ch24"]})
         for fc in rotation_forecast(stats, self.K, self.cfg, now, native_hot=nh):
             lab_from = stats[fc["from"]]["label"] if fc["from"] in stats else fc["from"].replace("native:", "") + " (عملة أم)"
+            self._dbx(self._db_rotation, fc, stats, now)
             b = fc["to"]
             picks = rotation_early(sector_data.get(b, []), stats[b], self.vr, self.cfg, int(rc["max_coins"]))
             if not picks:
@@ -3980,6 +4407,9 @@ class Engine:
             if abs(m) >= 0.5:
                 adj.append(("السيولة العالمية", m))
         c.features["accum"] = absorption_score(r, coin.ch1h, coin.ch24h) if r is not None else None
+        c.meta["evidence"] = self._evidence(c)
+        if self.quant:
+            adj += self.quant.adjust(c, g_state(self.glob), (self.stats.get(c.meta.get("sector_key") or "") or {}).get("stage"))
         c.meta["adj"] = adj
 
     def _explain(self, c: Candidate, s: float) -> dict:
@@ -4011,7 +4441,10 @@ class Engine:
         self.budget = Budget(d, self.cfg, now, monthly=float(self.cfg.get("paprika.monthly_budget")) if self.bulk else None)
         self.members, self.byid = {}, {}
         self.discovery = Discovery(self.cfg, d, self.s.eth)
-        self.whale = WhaleBot(self.cfg, self.s.xfer, self.s.sol, self.s.dex, d, extra_wallets=self.discovery.wallets())
+        if self.db:
+            self._stage("quant", lambda: self._quant_start(now))
+        self.whale = WhaleBot(self.cfg, self.s.xfer, self.s.sol, self.s.dex, d, extra_wallets=self.discovery.wallets(),
+                              wallet_mult=self.wallet_mult)
 
         if self.s.ex and self.cfg.get("live.enabled"):
             self.tickers = self._stage("tickers", self.s.ex.tickers, {}) or {}
@@ -4033,6 +4466,9 @@ class Engine:
         self._stage("macro", lambda: self._macro(now))
 
         self._stage("positions", lambda: self._track_positions(now))
+        if self.db:
+            self._stage("obs_update", lambda: self._dbx(self._obs_update, now))
+            self._stage("wallet_eval", lambda: self._dbx(self._wallet_eval, now))
 
         fresh_sectors = {k[2:] for k in self.fresh_keys if k.startswith("s:")}
         stats, cands = self._stage("sector", lambda: sector_analyze(
@@ -4069,6 +4505,8 @@ class Engine:
                 merged[c.coin.id] = c
 
         events = self._stage("whales", lambda: self.whale.scan_wallets(now) if self.whale.enabled else [], [])
+        if self.db:
+            self._dbx(self._db_wallet_events, events, now)
         self.summary["wallets"] = {"checked": self.whale.checked, "failed": list(self.whale.failed)}
         self._stage("distribution", lambda: self._distribution(now, events, flows))
         self._stage("whale_only", lambda: self._add_whale_only(events, merged))
@@ -4124,6 +4562,7 @@ class Engine:
         for s, c in scored:
             ev = self._evidence(c)
             c.meta["evidence"] = ev
+            c.meta["tier"] = None
             gate = c.meta.get("gate", "strict")
             state = c.meta.get("state")
             if s >= threshold and gate == "strict":
@@ -4145,7 +4584,8 @@ class Engine:
             if not plan:
                 continue
             extra = {"xratio": self.vr(c.coin) if c.coin.live else None, "history": c.meta.get("history"),
-                     "news": c.meta.get("news"), "tier": tier, "evidence": ev, **self._explain(c, s)}
+                     "news": c.meta.get("news"), "tier": tier, "evidence": ev, **self._explain(c, s),
+                     "risk": self.quant.risk_pct(tier if tier != "W" else "B", d["closed"]) if self.quant else (1.0 if tier == "A" else 0.5)}
             if tier != "W" and self.s.judge and judged < int(self.cfg.get("context.llm.max_calls_per_run")):
                 judged += 1
                 verdict = self._stage("llm", lambda c=c, s=s, plan=plan: self.s.judge.review(self._llm_summary(c, s, plan)))
@@ -4171,6 +4611,11 @@ class Engine:
                 opened["W"] += 1
             self.ideas.append(idea)
         self.summary["ideas"] = [(i["tier"], round(i["score"], 1), i["cand"].coin.symbol, i["opened"]) for i in self.ideas]
+        if self.db:
+            self._dbx(self._db_snapshot, now, scored)
+            if self.quant and self.quant.n_labeled >= 20 and now - d["meta"].get("last_quant", 0) >= float(self.cfg.get("quant.report_hours")) * 3600:
+                if self._send(format_quant_report(self.quant.report(), self.cfg.get("run.timezone"))):
+                    d["meta"]["last_quant"] = now
 
         self._heartbeat(now, stats)
         self._report_errors(now)
@@ -4454,6 +4899,10 @@ class Engine:
             "contract": ({"chain": dex["chain"], "addr": dex["addr"], "pair": dex.get("pair", "")} if dex else None),
         })
         d["cooldown"][c.coin.id] = now
+        pos = d["open"][-1]
+        pos["glob0"], pos["state0"] = (self.glob or {}).get("score"), c.meta.get("state")
+        if self.db:
+            pos["db"] = self._dbx(self._db_trade_open, pos, c)
 
     # ------------------------------------------------------------------ تتبع الصفقات المفتوحة
     def _prices_for(self, open_sigs: list) -> dict:
@@ -4544,6 +4993,10 @@ class Engine:
                    "ret": round(ret, 2), "hit": s["hit"], "mfe": round((s["hi"] / s["entry"] - 1) * 100, 2),
                    "mae": round((s["lo"] / s["entry"] - 1) * 100, 2), "reason": reason,
                    "features": s["features"], "ts": s["ts"], "closed": now}
+            warned = bool(self.db and self.db.q("SELECT 1 FROM warnings WHERE symbol = ? AND ts >= ? LIMIT 1", (s["symbol"], s["ts"])))
+            rec["pm"] = postmortem(s, ret, reason, age / 3600.0, (self.glob or {}).get("score"), warned)
+            if self.db:
+                self._dbx(self._db_trade_close, s, rec, now)
             d["closed"].append(rec)
             samples.append((s["features"], y))
             self.summary["closed"] += 1
@@ -4640,7 +5093,7 @@ class Engine:
         return hrs > 0 and bool(self.stats) and now - self.state.data["meta"].get("last_heartbeat", 0) >= hrs * 3600
 
     def _opinion(self) -> list:
-        """رأي الرادار: أين تتجه السيولة ولماذا، وماذا يفعل المتداول (قواعد صريحة، لا تخمين)."""
+        """رأي الرادار المختصر: الاتجاه العام، أين تذهب السيولة، التالي المتوقع، تحذير المرحلة، والخلاصة."""
         e = html.escape
         g = self.glob or {}
         sc = g.get("score")
@@ -4648,89 +5101,78 @@ class Engine:
             bias, face = "UNKNOWN", "⚪"
         else:
             bias, face = (("RISK-ON", "🟢") if sc >= 62 else (("RISK-OFF", "🔴") if sc <= 42 else ("NEUTRAL", "🟡")))
-        L = [f"🌍 Global Liquidity · السيولة العالمية: <b>{sc:.0f}/100</b> {face} {bias}" if sc is not None
-             else "🌍 Global Liquidity · السيولة العالمية: غير متاحة الآن ⚪"]
+        L = [f"{face} <b>{bias}</b>" + (f"  {sc:.0f}/100" if sc is not None else "")]
         heads = []
         if self.deploy:
             d0 = self.deploy[0]
             pct = d0.get("of_global") if d0.get("of_global") is not None else d0["share"]
-            heads.append(f"💵 الدولار الجديد → <b>{e(str(d0['chain']))}</b> ({pct * 100:.0f}%)")
+            heads.append(f"{e(str(d0['chain']))} (دولار جديد {pct * 100:.0f}%)")
         if self.chainflow:
             tc = max(self.chainflow.values(), key=lambda x: x["score"])
-            heads.append(f"⛓ أقوى شبكة: <b>{e(tc['label'])}</b> ({tc['score']:.0f}/100)")
-        hot = sorted((x for x in self.stats.values() if x["heat"] > 0), key=lambda x: -x["heat"])[:2]
-        stg = {"leaders": "قيادة", "broadening": "اتساع", "late": "متأخرة", "cooling": "تبريد", "running": "جارٍ", "quiet": "هادئ"}
-        if hot:
-            heads.append("🔥 " + " · ".join(f"<b>{e(x['label'].split('·')[0].strip())}</b> {x['heat']:+.1f}% ({stg.get(x.get('stage'), '')})" for x in hot))
+            if not heads or tc["label"] not in heads[0]:
+                heads.append(f"{e(tc['label'])} ({tc['score']:.0f})")
         cs = [r for r in self.chsec if r["score"] is not None and r["score"] >= 60][:1]
         if cs:
-            heads.append(f"🏗 {e(cs[0]['chain'])}·{e(cs[0]['cat'])} TVL {cs[0]['g7']:+.0f}%")
-        L.append("💧 Liquidity flows to · السيولة تتجه إلى:" if heads else "💧 لا اتجاه واضح للسيولة الآن")
-        L += [f"   {h}" for h in heads]
+            heads.append(f"{e(cs[0]['chain'])}·{e(cs[0]['cat'])} TVL {cs[0]['g7']:+.0f}%")
+        L.append("💧 السيولة → " + (" · ".join(heads) if heads else "لا اتجاه واضح"))
         rot = self.summary.get("rotation") or []
         if rot:
-            b, conf = rot[0][1], rot[0][2]
-            lab = self.stats.get(b, {}).get("label", b).split("·")[0].strip()
-            L.append(f"🔭 Next · التالي المتوقع: <b>{e(lab)}</b> (ثقة {conf * 100:.0f}%)")
-        if bias == "RISK-OFF":
-            L.append("💡 الخلاصة: السيولة العامة ضعيفة → صفقات صغيرة ومبكرة فقط، لا تطارد الصعود.")
-        elif bias == "RISK-ON":
-            L.append("💡 الخلاصة: بيئة داعمة → الأفضلية للقطاع الأسخن وللمتأخرات داخله.")
-        else:
-            L.append("💡 الخلاصة: بيئة محايدة → انتقائية، ركّز على القطاعات في مرحلة اتساع.")
+            lab = self.stats.get(rot[0][1], {}).get("label", rot[0][1]).split("·")[0].strip()
+            L.append(f"🔭 التالي: <b>{e(lab)}</b> (ثقة {rot[0][2] * 100:.0f}%)")
+        hot = sorted((x for x in self.stats.values() if x["heat"] > 0), key=lambda x: -x["heat"])[:1]
+        if hot and hot[0].get("stage") in ("cooling", "late"):
+            L.append(f"⚠️ {e(hot[0]['label'].split('·')[0].strip())} في {'تبريد' if hot[0]['stage'] == 'cooling' else 'آخر الموجة'}: لا تطارد")
+        L.append({"RISK-OFF": "💡 صفقات صغيرة ومبكرة فقط", "RISK-ON": "💡 بيئة داعمة: الأفضلية للقطاع الأسخن ولمتأخراته"}.get(bias, "💡 انتقائية: ركّز على القطاعات في مرحلة اتساع"))
         return L
 
     def _idea_lines(self, n: int, idea: dict) -> list:
         e, c, p = html.escape, idea["cand"], idea["plan"]
-        tier = idea["tier"]
-        tag = {"A": "🟢 STRONG · قوية", "B": "🟡 EARLY · مبكرة (نصف حجم)", "W": "👀 WATCH · مراقبة"}[tier]
-        L = [f"{NUM[n]} {tag}  <b>#{e(c.coin.symbol)}</b> · {e(c.coin.name[:20])}  <i>({idea['score']:.0f}){' ✅ فُتحت' if idea['opened'] else ''}</i>"]
+        tag = {"A": "🟢 STRONG", "B": "🟡 EARLY", "W": "👀 WATCH"}[idea["tier"]]
         lo, hi = p.get("entry", (c.coin.price, c.coin.price))
-        if tier == "W":
-            L.append(f"   📍 Trigger · شرط الدخول: فوق <code>${fmt_price(c.coin.price * 1.008)}</code> مع حجم داعم")
+        head = f"{NUM[n]} {tag} <b>#{e(c.coin.symbol)}</b>" + (" ✅" if idea["opened"] else "")
+        if idea["tier"] == "W":
+            head += f"  ⏳ فوق <code>${fmt_price(c.coin.price * 1.008)}</code>"
         else:
-            L.append(f"   📍 Entry · الدخول: <code>${fmt_price(lo)}</code> – <code>${fmt_price(hi)}</code>")
-        L.append("   🎯 " + " · ".join(f"T{t['k']} <code>${fmt_price(t['price'])}</code> <b>+{t['pct']:.0f}%</b>" for t in p["targets"][:3]))
-        L.append(f"   🛑 Stop · الوقف: <code>${fmt_price(p['stop'])}</code> <b>−{p['stop_pct']:.1f}%</b>")
-        why = [t for _, t in sorted(c.reasons, key=lambda r: r[0])][:1]
-        if why:
-            L.append(f"   💬 {e(_cut(why[0], 80))}")
-        if idea["extra"].get("evidence"):
-            L.append("   ✔ " + e(" · ".join(idea["extra"]["evidence"][:4])))
-        return L
+            head += f"  📍 <code>${fmt_price(lo)}</code>–<code>{fmt_price(hi)}</code>"
+        return [head, "   🎯 " + " · ".join(f"<code>${fmt_price(t['price'])}</code>" for t in p["targets"][:3])
+                + f"  <i>(+{'/'.join(f'{t['pct']:.0f}' for t in p['targets'][:3])}%)</i>",
+                f"   🛑 <code>${fmt_price(p['stop'])}</code> <b>−{p['stop_pct']:.1f}%</b>"]
 
     def _heartbeat(self, now: float, stats: dict) -> None:
-        """التقرير الدوري: ① القطاعات المفحوصة ② رأي الرادار ③ الصفقات المقترحة (دخول/أهداف/وقف)."""
+        """التقرير الدوري المختصر: ① القطاعات ② الرأي ③ الصفقات ④ مفتوحة ونتائج."""
         if not self._report_due(now):
             return
         e = html.escape
         meta = self.state.data["meta"]
         wr, n = self.brain.win_rate()
+        short = lambda x: e(x["label"].split("·")[0].strip())  # noqa: E731
         ranked = sorted(stats.values(), key=lambda x: x["heat"], reverse=True)
-        L = ["📡 <b>RADAR REPORT · تقرير الرادار</b>", LINE_S, "",
-             f"🔎 <b>Sectors Scanned · القطاعات المفحوصة</b>  ({len(stats)}/{len(self.cfg.sectors)})"]
+        L = [f"📡 <b>RADAR · تقرير الرادار</b>   <i>{now_label(self.cfg.get('run.timezone'))}</i>", LINE_S,
+             f"🔎 <b>فُحص {len(stats)}/{len(self.cfg.sectors)} قطاعاً</b>"]
         if ranked:
-            L.append("🔥 " + " · ".join(f"{e(x['label'].split('·')[0].strip())} {x['heat']:+.1f}%" for x in ranked[:4]))
+            L.append("🔥 " + " · ".join(f"{short(x)} {x['heat']:+.1f}" for x in ranked[:4]))
             cold = [x for x in ranked[::-1] if x["heat"] < 0 and x not in ranked[:4]][:2]
             if cold:
-                L.append("🧊 " + " · ".join(f"{e(x['label'].split('·')[0].strip())} {x['heat']:+.1f}%" for x in cold))
+                L.append("🧊 " + " · ".join(f"{short(x)} {x['heat']:+.1f}" for x in cold))
         if self.chainflow:
-            tops = sorted(self.chainflow.values(), key=lambda x: -x["score"])[:4]
-            L.append("⛓ " + " · ".join(f"{e(t['label'])} {t['score']:.0f}" for t in tops))
-        L += ["", "🧠 <b>Radar View · رأي الرادار</b>"] + self._opinion()
-        L += ["", "📈 <b>Trade Ideas · صفقات مقترحة</b>"]
-        ideas = sorted(self.ideas, key=lambda i: (-{"A": 2, "B": 1, "W": 0}[i["tier"]], -i["score"]))[:4]
+            L.append("⛓ " + " · ".join(f"{e(t['label'])} {t['score']:.0f}" for t in sorted(self.chainflow.values(), key=lambda x: -x["score"])[:3]))
+        L += ["", "🧠 <b>الرأي</b>"] + self._opinion()
+        L += ["", "📈 <b>الصفقات</b>"]
+        ideas = sorted(self.ideas, key=lambda i: (-{"A": 2, "B": 1, "W": 0}[i["tier"]], -i["score"]))[:3]
         if ideas:
             for k, idea in enumerate(ideas):
                 L += self._idea_lines(k, idea)
         else:
             near = self.summary.get("near_miss", [])[:3]
-            L.append("لا فرص كافية الآن" + (" — الأقرب: " + " · ".join(f"{e(sym)} {sc:.0f}" for sc, sym, _ in near) if near else ""))
-        w = self.summary.get("wallets")
-        L += ["", f"📂 Open {len(self.state.data['open'])} · Closed {n}" + (f" · Win {wr * 100:.0f}%" if wr is not None else "")
-              + (f" · 🐋 {w['checked']} wallets" if w else ""),
-              f"📶 {self.summary.get('live') or 'no live prices'} · ⏱ {now_label(self.cfg.get('run.timezone'))}",
-              "<i>⚠️ ليست نصيحة مالية — التزم بالوقف وأدر المخاطر</i>"]
+            L.append("لا فرص الآن" + (" — الأقرب: " + " · ".join(f"{e(sym)} {sc:.0f}" for sc, sym, _ in near) if near else ""))
+        op = self.state.data["open"]
+        if op:
+            L += ["", "📂 <b>مفتوحة:</b> " + " · ".join(
+                f"#{e(p['symbol'])} {((p.get('last') or p['entry']) / p['entry'] - 1) * 100:+.1f}%" + (f" ✓T{p['hit']}" if p.get("hit") else "") for p in op[:4])]
+        foot = f"📊 أُغلقت {n}" + (f" · نجاح {wr * 100:.0f}%" + (" (عينة صغيرة)" if n < 10 else "") if wr is not None else "")
+        if self.quant and self.quant.n_labeled:
+            foot += f" · 🧬 {self.quant.n_labeled} ملاحظة تعلّم"
+        L += ["", foot, "<i>⚠️ ليست نصيحة مالية</i>"]
         if self._send(safe_join(L, 3900)):
             meta["last_heartbeat"] = now
 
@@ -4772,6 +5214,10 @@ REQUIRED_KEYS = {
     "live": ["enabled", "exchanges", "match_tolerance", "snapshot_hours", "klines_per_run"],
     "paprika": ["monthly_budget"],
     "macro": ["enabled", "refresh_minutes", "mint_alert_usd"],
+    "quant": ["shadow_top", "shadow_cooldown_h", "shadow_horizon_h", "shadow_weight", "min_n", "min_total", "shrink_k", "adj_gain",
+              "lesson_cap", "total_cap", "apply_adjustments", "auto_thresholds", "calib_min", "wallet_min_n", "report_hours",
+              "retention_days", "obs_days"],
+    "db": ["path"],
     "chainflow": ["refresh_hours", "max_per_run", "min_sector_score", "min_tvl_growth", "max_groups"],
     "quality": ["min_quality", "warn_manip", "block_manip", "hot_funding", "macro_max"],
     "rotation": ["enabled", "min_source_heat", "min_conf", "window_low", "window_high", "max_alerts_per_run", "cooldown_hours",
@@ -5088,7 +5534,7 @@ def _st_book(p):
 
 
 def _st_engine(tmp, cats=None, tickers=None, book=None, dex_price=None, now=NOW0, cfg=None, xfer=None, dex_tokens=None,
-               state=None, judge=None, news=None, macro=None, proto=None):
+               state=None, judge=None, news=None, macro=None, proto=None, db=True):
     cfg = cfg or _st_cfg()
     state = state or State(Path(tmp) / "state.json")
     holder = {"t": now}
@@ -5097,7 +5543,8 @@ def _st_engine(tmp, cats=None, tickers=None, book=None, dex_price=None, now=NOW0
     svc = Services(cg=_FakeCG(cats if cats is not None else _st_cats()), llama=_FakeLlama(),
                    dex=_FakeDex(dex_price or lag, dex_tokens),
                    ex=_FakeEx(tickers if tickers is not None else _st_tickers(rows), book if book is not None else _st_book(lag)),
-                   xfer=xfer, notifier=_FakeNotifier(), judge=judge, news=news, macro=macro)
+                   xfer=xfer, notifier=_FakeNotifier(), judge=judge, news=news, macro=macro,
+                   db=RadarDB(":memory:") if db is True else db)
     if proto:
         svc.llama.proto = proto
     return Engine(cfg, state, svc, now_fn=lambda: holder["t"]), svc, state, holder
@@ -5761,19 +6208,18 @@ def _t_tiers_and_report(tmp):
     assert pos["tier"] == "B" and pos["size"] == 0.5 and len(pos["evidence"]) >= 2, pos
     alert = [m for m in svc.notifier.sent if "EARLY" in m and "ENTRY" in m]
     assert alert and "نصف حجم" in alert[0]
-    rep = [m for m in svc.notifier.sent if "RADAR REPORT" in m]
+    rep = [m for m in svc.notifier.sent if "RADAR · تقرير الرادار" in m]
     assert rep, "التقرير لم يُرسل"
     r = rep[0]
-    for part in ("Sectors Scanned · القطاعات المفحوصة", "Radar View · رأي الرادار", "Trade Ideas · صفقات مقترحة", "Entry · الدخول",
-                 "Stop · الوقف", "Global Liquidity", "الخلاصة"):
+    for part in ("RADAR · تقرير الرادار", "فُحص", "الرأي", "الصفقات", "EARLY", "🎯", "🛑", "💡", "مفتوحة"):
         assert part in r, part
-    assert r.index("Sectors Scanned") < r.index("Radar View") < r.index("Trade Ideas") and len(r) < 3900
+    assert r.index("فُحص") < r.index("الرأي") < r.index("الصفقات") and len(r) < 2200, len(r)
     eng.cfg.settings["run"].update(min_score=99, flex_score=95)  # لا أدلة كافية ولا درجة: لا فتح
     eng2, svc2, st2, _ = _st_engine(tmp + "_n", macro=_FakeMacro(True), proto=proto)
     eng2.cfg.settings["run"].update(min_score=99, flex_score=95, heartbeat_hours=3)
     eng2.run()
     assert not st2.data["open"]
-    assert [m for m in svc2.notifier.sent if "RADAR REPORT" in m]
+    assert [m for m in svc2.notifier.sent if "RADAR · تقرير الرادار" in m]
 
 
 def _t_dry_run_isolated(tmp):
@@ -5862,11 +6308,11 @@ def _t_mint_and_digest(tmp):
     eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(True))
     eng.cfg.settings["run"]["heartbeat_hours"] = 6
     eng.run()
-    d = [m for m in svc.notifier.sent if "RADAR REPORT" in m]
-    assert d and "Radar View" in d[0] and len(d[0]) < 3900, svc.notifier.sent[:2]
+    d = [m for m in svc.notifier.sent if "RADAR · تقرير الرادار" in m]
+    assert d and "الرأي" in d[0] and len(d[0]) < 2200, svc.notifier.sent[:2]
     eng2 = Engine(eng.cfg, state, svc, now_fn=lambda: NOW0 + 600)
     eng2.run()
-    assert sum("RADAR REPORT" in m for m in svc.notifier.sent) == 1, "التقرير تكرر قبل 6 ساعات"
+    assert sum("RADAR · تقرير الرادار" in m for m in svc.notifier.sent) == 1, "التقرير تكرر قبل 6 ساعات"
 
 
 def _t_telegram_fallback():
@@ -5879,6 +6325,131 @@ def _t_telegram_fallback():
 
     ok = Telegram(H(), "1:x", "5").send("<b>مرحبا</b> &amp; <i>اختبار</i>")
     assert ok and len(sent) == 2 and "parse_mode" not in sent[1] and sent[1]["text"] == "مرحبا & اختبار"
+
+
+def _t_db_store(tmp):
+    eng, svc, state, holder = _st_engine(tmp)
+    eng.run()
+    db = svc.db
+    c = db.counts()
+    assert c["runs"] == 1 and c["sector_scans"] >= 5 and c["observations"] >= 1 and c["trades"] == 1, c
+    t = db.q("SELECT * FROM trades")[0]
+    assert t["symbol"] == "LAG" and t["tier"] == "A" and t["ts_close"] is None and t["entry"] > 0 and json.loads(t["targets"])
+    svc.ex._t["LAG"]["price"] *= 1.35  # الصعود يحقق كل الأهداف
+    holder["t"] += 3600
+    Engine(eng.cfg, state, svc, now_fn=lambda: holder["t"]).run()
+    t = db.q("SELECT * FROM trades")[0]
+    assert t["y"] == 1 and t["hit"] >= 1 and t["ret"] > 5 and "نجاح" in t["postmortem"] and t["ts_close"], t
+    ob = db.q("SELECT * FROM observations WHERE symbol = 'LAG' ORDER BY id")[0]
+    assert ob["status"] == "win" and ob["y"] == 1 and ob["opened"] == 1 and ob["r"] > 0, ob
+    assert db.counts()["runs"] == 2 and state.data["closed"][0]["pm"]
+    db.prune(holder["t"] + 200 * 86400)
+    assert db.counts()["sector_scans"] == 0 and db.counts()["trades"] == 1  # الصفقات تبقى دائماً
+
+
+def _t_shadow_learning(tmp):
+    lab = barrier_label(100.0, 108.0, 108.0, 99.0, 5.0, 8.0, 3.0, 36.0, 1.8)
+    assert lab["status"] == "win" and lab["y"] == 1 and lab["r"] == 1.8
+    assert barrier_label(100.0, 94.0, 101.0, 94.0, 5.0, 8.0, 3.0, 36.0, 1.8)["status"] == "loss"
+    assert barrier_label(100.0, 102.0, 103.0, 99.0, 5.0, 8.0, 40.0, 36.0, 1.8)["status"] == "expired"
+    assert barrier_label(100.0, 101.0, 103.0, 99.0, 5.0, 8.0, 5.0, 36.0, 1.8) is None
+    eng, svc, state, holder = _st_engine(tmp)
+    eng.cfg.settings["run"].update(min_score=95, flex_score=94, watch_floor=99)  # لا فتح: الملاحظة «ظل» فقط
+    eng.run()
+    ob = svc.db.q("SELECT * FROM observations WHERE symbol = 'LAG'")
+    assert ob and ob[0]["opened"] == 0 and not state.data["open"], ob
+    n0 = state.data["model"]["n"]
+    svc.ex._t["LAG"]["price"] *= 1.25
+    holder["t"] += 1800
+    Engine(eng.cfg, state, svc, now_fn=lambda: holder["t"]).run()
+    ob = svc.db.q("SELECT * FROM observations WHERE symbol = 'LAG' ORDER BY id")[0]
+    assert ob["status"] == "win" and ob["y"] == 1, ob
+    assert abs(state.data["model"]["n"] - n0 - 0.3) < 1e-6, (n0, state.data["model"]["n"])  # تعلّم بوزن الظل 0.3
+
+
+def _mk_obs(db, n, sector, y, score, state_="SEEDING", regime="NEUTRAL", ev=("حجم مرتفع",), ts=1.0):
+    for _ in range(n):
+        db.x("INSERT INTO observations(ts, coin_id, symbol, sector, kind, state, regime, stage, score, price, stop_pct, tgt_pct,"
+             " features, evidence, opened, status, r, y, ret) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             (ts, "c", "C", sector, "sector", state_, regime, "running", score, 1.0, 5.0, 9.0, "{}", json.dumps(list(ev), ensure_ascii=False),
+              0, "win" if y else "loss", 1.8 if y else -1.0, y, 9.0 if y else -5.0))
+    db.commit()
+
+
+def _t_quant_lessons():
+    db = RadarDB(":memory:")
+    cfg = _st_cfg()
+    _mk_obs(db, 14, "meme", 0, 28)
+    _mk_obs(db, 2, "meme", 1, 28)
+    _mk_obs(db, 13, "depin", 1, 62, ev=("حيتان",))
+    _mk_obs(db, 3, "depin", 0, 62, ev=("حيتان",))
+    _mk_obs(db, 20, "defi", 1, 50)
+    _mk_obs(db, 20, "defi", 0, 50)
+    q = Quant(db, cfg)
+    q.refresh(NOW0)
+    assert q.n_labeled == 72 and q.adj[("sector", "meme")][0] < -2 and q.adj[("sector", "depin")][0] > 2 and abs(q.adj[("sector", "defi")][0]) < 1.5
+    assert db.q("SELECT COUNT(*) c FROM lessons")[0]["c"] > 5
+
+    class Cd:
+        kinds = {"sector"}
+        meta = {"sector_key": "meme", "state": "SEEDING", "chain": None, "evidence": ["حجم مرتفع"]}
+    bad = q.adjust(Cd(), "NEUTRAL", "running")
+    assert bad and bad[0][1] < 0 and abs(bad[0][1]) <= 8 and "meme" in bad[0][0]
+    Cd.meta = {"sector_key": "depin", "state": "SEEDING", "chain": None, "evidence": ["حيتان"]}
+    assert q.adjust(Cd(), "NEUTRAL", "running")[0][1] > 0
+    small = Quant(RadarDB(":memory:"), cfg)
+    small.refresh(NOW0)
+    assert small.adjust(Cd(), None, None) == [] and small.calibrate() is None  # لا دروس قبل بيانات كافية
+    # المعايرة: النجاح يبدأ فوق درجة ~45
+    db2 = RadarDB(":memory:")
+    for sc in range(15, 76, 3):
+        _mk_obs(db2, 3, "x", 1 if sc >= 45 else 0, sc)
+    cal = Quant(db2, cfg).calibrate()
+    assert cal and cal["flex"] and 25 <= cal["flex"] <= 50 and cal["strict"] and cal["strict"] >= cal["flex"] + 8, cal
+    # محافظ: ترتفع أوزان الناجحة وتنخفض الفاشلة
+    for i in range(6):
+        db.x("INSERT INTO wallet_events(ts, wallet, chain, addr, symbol, kind, usd, price, ret24, label) VALUES(1,'GoodW','ethereum','a','T','accumulation',1,1,5,1)")
+        db.x("INSERT INTO wallet_events(ts, wallet, chain, addr, symbol, kind, usd, price, ret24, label) VALUES(1,'BadW','ethereum','a','T','accumulation',1,1,-5,0)")
+    db.commit()
+    wm = q.wallet_mults()
+    assert wm["GoodW"] > 1.0 > wm["BadW"] >= 0.4, wm
+    closed = [{"y": 1, "ret": 8.0}] * 14 + [{"y": 0, "ret": -5.0}] * 6
+    assert q.risk_pct("A", closed[:5]) == 1.0 and q.risk_pct("B", closed[:5]) == 0.5
+    ra, rb = q.risk_pct("A", closed), q.risk_pct("B", closed)
+    assert 0.25 <= ra <= 1.5 and abs(rb - ra * 0.5) < 0.02
+    rep = q.report()
+    msg = format_quant_report(rep, "UTC")
+    assert "QUANT REPORT" in msg and "🏆" in msg and "⚠️" in msg and "🎚" not in msg or "🎚" in msg
+    assert len(msg) < 2500 and msg.count("<b>") == msg.count("</b>")
+
+
+def _t_postmortem():
+    pos = {"entry": 100.0, "hi": 103.0, "targets": [{"pct": 5.0}], "hit": 0, "glob0": 60.0, "state0": "IGNITION"}
+    t = postmortem(pos, -5.0, "stop", 1.0, 45.0, True)
+    for part in ("وقف سريع", "IGNITION", "تدهورت السيولة", "تحذير تصريف"):
+        assert part in t, (part, t)
+    won = postmortem({"entry": 100.0, "hi": 120.0, "targets": [{"pct": 5.0}], "hit": 3}, 19.0, "target", 24.0, None, False)
+    assert "نجاح" in won and "كل الأهداف" in won
+    assert "انتهت المهلة" in postmortem({"entry": 100.0, "hi": 101.0, "targets": [{"pct": 5.0}], "hit": 0}, 0.5, "expired", 40.0, None, False)
+
+
+def _t_report_concise(tmp):
+    eng, svc, state, _ = _st_engine(tmp, macro=_FakeMacro(False))
+    eng.cfg.settings["run"].update(heartbeat_hours=3, message_style="compact")
+    eng.run()
+    r = [m for m in svc.notifier.sent if "RADAR · تقرير الرادار" in m]
+    assert r and len(r[0]) < 1900 and r[0].count("\n") <= 30, (len(r[0]) if r else None)
+    t = r[0]
+    for part in ("فُحص", "🔥", "🧠", "💧", "📈", "📂", "مفتوحة:", "#LAG", "ليست نصيحة مالية"):
+        assert part in t, part
+    assert t.count("<b>") == t.count("</b>")
+
+
+def _t_sql_guard():
+    assert safe_sql("SELECT * FROM trades") and safe_sql("  select count(*) from runs;") and safe_sql("WITH a AS (SELECT 1) SELECT * FROM a")
+    for bad in ("DROP TABLE trades", "DELETE FROM runs", "SELECT 1; DROP TABLE runs", "UPDATE trades SET y=1", "PRAGMA writable_schema=1",
+                "ATTACH DATABASE 'x' AS y"):
+        assert not safe_sql(bad), bad
 
 
 def run_offline_selftest(verbose: bool = True) -> tuple:
@@ -5905,6 +6476,10 @@ def run_offline_selftest(verbose: bool = True) -> tuple:
               ("التلاعب + جودة السيولة + Whale Score + الاحتمال", _t_risk_engines, False),
               ("محرك Lead-Lag (إصابة/وقت/ثقة)", _t_leadlag_backtest, False),
               ("المحركات الكلية داخل الخط الكامل + التفسير", _t_macro_pipeline, True),
+              ("قاعدة SQL: تسجيل التشغيلات والصفقات والتقييم", _t_db_store, True),
+              ("تعلّم الظل بالحاجز الثلاثي", _t_shadow_learning, True), ("المحرك الكمي: دروس ومعايرة ومحافظ ومخاطرة", _t_quant_lessons, False),
+              ("التشخيص الآلي لأسباب النجاح/الفشل", _t_postmortem, False), ("التقرير الدوري المختصر", _t_report_concise, True),
+              ("حماية استعلامات SQL", _t_sql_guard, False),
               ("التنبيه المختصر الأنيق", _t_compact_message, True), ("الرادار المرن A/B/Watch + التقرير", _t_tiers_and_report, True), ("عزل الوضع التجريبي عن الحالة", _t_dry_run_isolated, True),
               ("الأسرار والتنظيف وأداة doctor", _t_secrets_and_doctor, False), ("بديل RPC لمحافظ EVM (بلا حجب)", _t_rpc_transfers, False),
               ("رسالة الضخ والملخص الدوري", _t_mint_and_digest, True), ("تيليجرام: رجوع لنص عادي عند رفض HTML", _t_telegram_fallback, False),
@@ -6057,7 +6632,8 @@ def make_services(cfg, http, dry_run: bool = False, notifier=None) -> Services:
                     llama=DefiLlama(http), dex=DexScreener(http),
                     ex=Exchanges(http, cfg.get("live.exchanges")) if cfg.get("live.enabled") else None,
                     xfer=Transfers(eth, Blockscout(http), RpcTransfers(http, {c: _clean_secret(os.environ.get(f"RPC_URL_{c.upper()}")) for c in RPC_URLS})), eth=eth, sol=sol, news=News(http), judge=judge,
-                    notifier=notifier, know=Knowledge.load(), macro=Macro(http, env.get("GH_TOKEN")))
+                    notifier=notifier, know=Knowledge.load(), macro=Macro(http, env.get("GH_TOKEN")),
+                    db=RadarDB(":memory:" if dry_run else (_clean_secret(os.environ.get("RADAR_DB")) or str(cfg.get("db.path")))))
 
 
 def capabilities(cfg, svc) -> list:
@@ -6104,6 +6680,8 @@ def cmd_run(args) -> int:
         return 0
     finally:
         state.save()  # نحفظ الحالة حتى لو حدث خطأ متأخر (لا يعمل في الوضع التجريبي)
+        if svc.db:
+            svc.db.close()
 
 
 def _print_live(rows: list) -> int:
@@ -6280,6 +6858,48 @@ def cmd_backtest(args) -> int:
     return 0
 
 
+def safe_sql(q: str) -> bool:
+    """يسمح باستعلامات القراءة فقط (SELECT/WITH) وبعبارة واحدة."""
+    t = q.strip().rstrip(";").strip()
+    return bool(re.match(r"(?is)^(select|with)\b", t)) and ";" not in t and not re.search(r"(?i)\b(attach|pragma|insert|update|delete|drop|alter|create|replace|vacuum)\b", t)
+
+
+def cmd_sql(args) -> int:
+    """python radar.py sql "SELECT symbol, ret FROM trades ORDER BY id DESC LIMIT 10" — قراءة فقط."""
+    cfg = load_config()
+    path = _clean_secret(os.environ.get("RADAR_DB")) or str(cfg.get("db.path"))
+    if not safe_sql(args.query):
+        print("❌ مسموح فقط باستعلام SELECT واحد (قراءة فقط)")
+        return 2
+    if not Path(path).exists():
+        print(f"❌ لا توجد قاعدة بيانات بعد: {path}")
+        return 1
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(args.query).fetchall()
+    for r in rows[: args.limit]:
+        print(" | ".join(str(x) for x in tuple(r)))
+    print(f"-- {min(len(rows), args.limit)}/{len(rows)} صف")
+    return 0
+
+
+def cmd_quant(args) -> int:
+    cfg = load_config()
+    path = _clean_secret(os.environ.get("RADAR_DB")) or str(cfg.get("db.path"))
+    if not Path(path).exists():
+        print(f"❌ لا توجد قاعدة بيانات بعد: {path} (شغّل run أولاً)")
+        return 1
+    db = RadarDB(path)
+    q = Quant(db, cfg)
+    q.refresh(time.time())
+    msg = format_quant_report(q.report(), cfg.get("run.timezone"))
+    print(html.unescape(re.sub(r"<[^>]+>", "", msg)))
+    if args.send:
+        tok, chat = cfg.env.get("TELEGRAM_BOT_TOKEN"), cfg.env.get("TELEGRAM_CHAT_ID")
+        print("📨 أُرسل" if tok and chat and Telegram(make_http(cfg), tok, chat).send(msg) else "⚠️ تعذّر الإرسال")
+    return 0
+
+
 def cmd_stats(args) -> int:
     cfg = load_config()
     st = State(args.state)
@@ -6441,6 +7061,9 @@ def cmd_doctor(args) -> int:
                      f"{n_sec} قطاعاً حُمّلت · أسعار لحظية: {s.get('live') or 'لا'} · إشارات {len(s['signals'])} · أخطاء داخلية {len(s['errors'])}"))
         for e in s["errors"][:5]:
             rows.append(("fail", "خطأ داخلي", e[:200]))
+        if svc.db:
+            cn = svc.db.counts()
+            rows.append(("ok", "قاعدة SQL", f"{cn['sector_scans']} مسح قطاع · {cn['observations']} ملاحظة تعلّم · {cn['runs']} تشغيلة"))
         if s["near_miss"]:
             rows.append(("ok", "أقرب المرشحين", " · ".join(f"{sym} {sc:.0f}" for sc, sym, _ in s["near_miss"][:4]) + f" (الحد {s.get('threshold')})"))
     except Exception as exc:  # الفحص يجب ألا ينهار أبداً
@@ -6494,6 +7117,11 @@ def main(argv=None) -> int:
     b = sub.add_parser("backtest", help="الاختبار الرجعي وحفظ knowledge.json")
     b.add_argument("--out", default=str(KNOWLEDGE_PATH))
     sub.add_parser("stats", help="إحصائيات التعلّم الذاتي")
+    qa = sub.add_parser("quant", help="تقرير المحرك الكمي: ما تعلّمه الرادار من ملاحظاته وصفقاته")
+    qa.add_argument("--send", action="store_true", help="أرسل التقرير إلى تيليجرام")
+    sq = sub.add_parser("sql", help="استعلام SELECT على قاعدة البيانات (قراءة فقط)")
+    sq.add_argument("query")
+    sq.add_argument("--limit", type=int, default=50)
     sub.add_parser("doctor", help="الفحص الشامل: الأسرار والمفاتيح والمزوّدون والكود وتشغيلة تجريبية + تقرير تيليجرام")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
@@ -6501,7 +7129,7 @@ def main(argv=None) -> int:
     if cmd == "run" and not hasattr(args, "dry_run"):
         args.dry_run = False
     handlers = {"run": cmd_run, "check": cmd_check, "selftest": cmd_selftest, "test-telegram": cmd_test_telegram,
-                "backtest": cmd_backtest, "stats": cmd_stats, "doctor": cmd_doctor}
+                "backtest": cmd_backtest, "stats": cmd_stats, "doctor": cmd_doctor, "quant": cmd_quant, "sql": cmd_sql}
     return handlers[cmd](args)
 
 
